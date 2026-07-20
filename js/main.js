@@ -1,0 +1,231 @@
+/* VN.demo + 초기화 + window.__vnDebug 테스트 훅 */
+window.VN = window.VN || {};
+
+/* ══════════════ 데모 노트 ══════════════ */
+VN.demo = (function () {
+  const U = () => VN.util;
+
+  /* AudioBuffer → 16bit PCM WAV Blob */
+  function encodeWAV(audioBuf) {
+    const ch = audioBuf.getChannelData(0);
+    const rate = audioBuf.sampleRate;
+    const len = ch.length;
+    const buf = new ArrayBuffer(44 + len * 2);
+    const v = new DataView(buf);
+    const wStr = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+    wStr(0, 'RIFF'); v.setUint32(4, 36 + len * 2, true); wStr(8, 'WAVE');
+    wStr(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+    wStr(36, 'data'); v.setUint32(40, len * 2, true);
+    for (let i = 0; i < len; i++) {
+      const s = Math.max(-1, Math.min(1, ch[i]));
+      v.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    }
+    return new Blob([buf], { type: 'audio/wav' });
+  }
+
+  /* WebAudio OfflineAudioContext로 합성한 짧은 톤 WAV (화자별 다른 음높이) */
+  async function synthAudio(segments, duration) {
+    const rate = 8000;
+    const off = new OfflineAudioContext(1, Math.ceil(rate * duration), rate);
+    const freqs = [330, 440, 550];
+    for (const s of segments) {
+      const osc = off.createOscillator();
+      const gain = off.createGain();
+      osc.frequency.value = freqs[(s.speaker || 0) % freqs.length];
+      osc.type = 'sine';
+      const st = s.start, en = Math.min(duration, s.end);
+      gain.gain.setValueAtTime(0, st);
+      gain.gain.linearRampToValueAtTime(0.12, st + 0.05);
+      gain.gain.setValueAtTime(0.12, Math.max(st + 0.05, en - 0.05));
+      gain.gain.linearRampToValueAtTime(0, en);
+      osc.connect(gain).connect(off.destination);
+      osc.start(st);
+      osc.stop(en);
+    }
+    const rendered = await off.startRendering();
+    return encodeWAV(rendered);
+  }
+
+  function demoSegments() {
+    const uid = () => VN.util.uid();
+    const rows = [
+      [0,  0.5,  5.5, '자, 다들 모이셨으니 신제품 런칭 준비 회의를 시작하겠습니다. 오늘 안건은 일정, 마케팅, 예산 세 가지입니다.'],
+      [1,  6.0, 10.5, '먼저 일정부터 말씀드리면, 개발은 다음 주 금요일에 코드 프리즈 예정입니다.'],
+      [0, 11.0, 14.5, '좋습니다. 그럼 QA 일정은 어떻게 되나요?'],
+      [2, 15.0, 20.0, 'QA는 코드 프리즈 후 2주간 진행하고, 8월 첫째 주까지 리그레션 테스트를 완료해야 합니다.', { bookmarked: true }],
+      [1, 20.5, 25.5, '런칭일은 8월 15일로 확정하는 게 좋겠습니다. 마케팅 캠페인도 그 날짜에 맞추겠습니다.', { highlighted: true }],
+      [0, 26.0, 30.0, '마케팅 예산은 어느 정도로 잡고 있나요? 지난 분기보다 예산이 줄어든 상황이라 확인이 필요합니다.'],
+      [2, 30.5, 35.5, '이번 캠페인 예산은 3천만 원으로 잡았고, 소셜 미디어 광고에 60%를 배정할 계획입니다.'],
+      [1, 36.0, 40.0, '인플루언서 협업 건은 제가 이번 주 수요일까지 리스트를 정리해서 공유하겠습니다.', { bookmarked: true }],
+      [0, 40.5, 44.5, '좋아요. 그리고 보도자료 초안은 홍보팀에 전달해 주세요. 금요일까지 검토가 필요합니다.'],
+      [2, 45.0, 49.0, '가격 정책은 월 9,900원 단일 요금제로 가기로 했습니다. 프로모션은 첫 달 무료입니다.', { highlighted: true }],
+      [1, 49.5, 53.0, '알겠습니다. 다음 회의 전까지 랜딩 페이지 시안을 준비해야 합니다.'],
+      [0, 53.5, 57.0, '정리하겠습니다. 런칭일 8월 15일 확정, 예산 3천만 원, 각자 할 일 확인해 주세요. 수고하셨습니다.']
+    ];
+    return rows.map(r => Object.assign({
+      id: uid(), speaker: r[0], start: r[1], end: r[2], text: r[3],
+      bookmarked: false, highlighted: false
+    }, r[4] || {}));
+  }
+
+  async function seedDemo() {
+    const segments = demoSegments();
+    const duration = 58;
+    let audioBlob = null, waveform = null;
+    try {
+      audioBlob = await synthAudio(segments, duration);
+      // 파형: 세그먼트 구간에서 진폭 표시
+      waveform = [];
+      const buckets = 240;
+      for (let i = 0; i < buckets; i++) {
+        const t = i / buckets * duration;
+        const inSeg = segments.some(s => t >= s.start && t <= s.end);
+        waveform.push(inSeg ? 0.35 + Math.random() * 0.45 : 0.05);
+      }
+    } catch (e) {
+      /* 오디오 합성 실패해도 노트는 생성 */
+    }
+    const note = VN.db.newNote({
+      title: '7월 20일 제품 런칭 회의 (데모)',
+      language: 'ko-KR',
+      duration,
+      audioBlob,
+      audioType: 'audio/wav',
+      sourceType: 'demo',
+      tags: ['회의', '데모'],
+      speakers: [{ name: '김팀장' }, { name: '이대리' }, { name: '박매니저' }],
+      segments,
+      memos: [
+        { id: VN.util.uid(), time: 21, text: '런칭일 8/15 — 캘린더에 등록할 것', createdAt: Date.now() },
+        { id: VN.util.uid(), time: 46, text: '가격 9,900원/월, 첫 달 무료 프로모션', createdAt: Date.now() }
+      ],
+      bookmarks: [{ id: VN.util.uid(), time: 15 }, { id: VN.util.uid(), time: 45 }],
+      waveform
+    });
+    await VN.db.saveNote(note);
+    if (VN.ui && VN.ui.refresh) await VN.ui.refresh();
+    return note;
+  }
+
+  return { seedDemo, encodeWAV, synthAudio, demoSegments };
+})();
+
+/* ══════════════ 테스트 훅 ══════════════ */
+window.__vnDebug = {
+  seedDemo: () => VN.demo.seedDemo(),
+
+  async createNoteFromBlob(blob, name) {
+    const note = VN.db.newNote({
+      title: name || '가져온 오디오',
+      audioBlob: blob,
+      audioType: blob.type || '',
+      sourceType: 'upload'
+    });
+    await VN.db.saveNote(note);
+    return note;
+  },
+
+  getState: () => VN.ui.getState(),
+
+  /* 요약기·SRT/TXT·검색·find&replace·DB CRUD·백업 직렬화를 실제 실행 */
+  async runSelfTest() {
+    const results = [];
+    const t = (name, pass, detail) => results.push({ name, pass: !!pass, detail: detail || '' });
+
+    // 테스트용 노트 (저장하지 않음)
+    const fake = VN.db.newNote({
+      title: '셀프테스트 회의',
+      duration: 30,
+      speakers: [{ name: '테스터A' }, { name: '테스터B' }],
+      segments: [
+        { id: 'a', speaker: 0, start: 0, end: 5, text: '오늘 예산 관련 회의를 시작하겠습니다.', bookmarked: false, highlighted: false },
+        { id: 'b', speaker: 1, start: 5.5, end: 12, text: '예산 보고서는 금요일까지 공유하겠습니다.', bookmarked: false, highlighted: false },
+        { id: 'c', speaker: 0, start: 12.5, end: 20, text: '마케팅 계획도 검토해 주세요.', bookmarked: false, highlighted: false }
+      ],
+      memos: [{ id: 'm', time: 6, text: '예산 확인 메모', createdAt: Date.now() }]
+    });
+
+    // 1) 요약기
+    try {
+      const sum = VN.summarizer.runLocal(fake);
+      t('summarizer.runLocal', sum.summary.length > 0 && sum.keywords.length > 0 && sum.todos.length > 0 && sum.topics.length > 0,
+        'keywords=' + sum.keywords.join(',') + ' todos=' + sum.todos.length);
+    } catch (e) { t('summarizer.runLocal', false, String(e)); }
+
+    // 2) SRT/TXT/VTT 생성
+    try {
+      const srt = VN.exporter.toSRT(fake);
+      t('exporter.toSRT', /^1\r\n00:00:00,000 --> 00:00:05,000/.test(srt) && srt.includes('테스터A'), srt.slice(0, 40));
+    } catch (e) { t('exporter.toSRT', false, String(e)); }
+    try {
+      const txt = VN.exporter.toTXT(fake, { speaker: true, time: true, memos: true });
+      t('exporter.toTXT', txt.includes('[00:00] 테스터A:') && txt.includes('--- 메모 ---'), txt.split('\r\n')[3] || '');
+    } catch (e) { t('exporter.toTXT', false, String(e)); }
+    try {
+      const vtt = VN.exporter.toVTT(fake);
+      t('exporter.toVTT', vtt.startsWith('WEBVTT') && vtt.includes('00:00:05.500 --> 00:00:12.000'), '');
+    } catch (e) { t('exporter.toVTT', false, String(e)); }
+
+    // 3) 전역 검색
+    try {
+      const r1 = VN.ui.searchNotes([fake], '예산');
+      const r2 = VN.ui.searchNotes([fake], '존재하지않는단어xyz');
+      t('search.global', r1.length === 1 && r1[0].snippet && r1[0].snippet.includes('예산') && r2.length === 0,
+        'hit=' + r1.length + ' miss=' + r2.length);
+    } catch (e) { t('search.global', false, String(e)); }
+
+    // 4) 찾아 바꾸기
+    try {
+      const clone = JSON.parse(JSON.stringify(fake));
+      const n = VN.ui.replaceInNote(clone, '예산', '버짓');
+      t('search.replaceInNote', n === 2 && clone.segments[0].text.includes('버짓') && !clone.segments[0].text.includes('예산'),
+        'replaced=' + n);
+    } catch (e) { t('search.replaceInNote', false, String(e)); }
+
+    // 5) DB CRUD (임시 데이터 정리 포함)
+    const testId = '__vntest-' + Date.now();
+    try {
+      const note = VN.db.newNote({ id: testId, title: 'CRUD 테스트' });
+      await VN.db.saveNote(note);
+      const got = await VN.db.getNote(testId);
+      note.title = 'CRUD 수정됨';
+      await VN.db.saveNote(note);
+      const got2 = await VN.db.getNote(testId);
+      await VN.db.trashNote(testId);
+      const inTrash = (await VN.db.getTrash()).some(x => x.id === testId);
+      await VN.db.purgeNote(testId);
+      const gone = !(await VN.db.getNote(testId)) && !(await VN.db.getTrash()).some(x => x.id === testId);
+      t('db.crud', got && got.title === 'CRUD 테스트' && got2.title === 'CRUD 수정됨' && inTrash && gone, '');
+    } catch (e) {
+      try { await VN.db.del('notes', testId); await VN.db.del('trash', testId); } catch (e2) { /* ignore */ }
+      t('db.crud', false, String(e));
+    }
+
+    // 6) 백업 직렬화
+    try {
+      const bk = await VN.db.backup(false);
+      const json = JSON.stringify(bk);
+      t('db.backup', bk.app === 'voicenote' && Array.isArray(bk.notes) && json.length > 50, 'bytes=' + json.length);
+    } catch (e) { t('db.backup', false, String(e)); }
+
+    console.table(results);
+    return results;
+  }
+};
+
+/* ══════════════ 초기화 ══════════════ */
+(async function () {
+  try {
+    await VN.db.open();
+    await VN.db.purgeExpiredTrash();   // 30일 지난 휴지통 자동 영구삭제
+  } catch (e) {
+    console.error('DB 초기화 실패', e);
+  }
+  await VN.ui.init();
+
+  // PWA 서비스 워커 (network-first — sw.js 참고)
+  if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1')) {
+    navigator.serviceWorker.register('sw.js').catch(() => { /* 등록 실패해도 앱 동작에는 영향 없음 */ });
+  }
+})();

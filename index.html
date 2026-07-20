@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#03C75A">
+  <title>보이스노트</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app">
+    <button id="sidebar-toggle" class="icon-btn" title="메뉴" aria-label="메뉴">☰</button>
+    <aside id="sidebar">
+      <div class="sidebar-logo">
+        <span class="logo-dot"></span>
+        <span class="logo-text">보이스노트</span>
+      </div>
+      <div class="sidebar-actions">
+        <button id="btn-new-record" class="btn btn-primary btn-block">● 새 녹음</button>
+        <button id="btn-import-file" class="btn btn-outline btn-block">파일 불러오기</button>
+      </div>
+      <nav id="sidebar-nav"><!-- ui.js 렌더링 --></nav>
+      <div id="sidebar-footer">
+        <div id="storage-info" class="muted small"></div>
+      </div>
+    </aside>
+    <div id="sidebar-backdrop"></div>
+    <main id="main"><!-- ui.js 렌더링 --></main>
+  </div>
+  <input type="file" id="file-input" accept=".mp3,.m4a,.aac,.wav,.webm,.ogg,audio/*" hidden>
+  <input type="file" id="restore-input" accept=".json,application/json" hidden>
+  <div id="modal-root"></div>
+  <div id="toast-root"></div>
+  <script src="js/db.js"></script>
+  <script src="js/recorder.js"></script>
+  <script src="js/stt.js"></script>
+  <script src="js/whisper.js"></script>
+  <script src="js/summarizer.js"></script>
+  <script src="js/exporter.js"></script>
+  <script src="js/player.js"></script>
+  <script src="js/ui.js"></script>
+  <script src="js/main.js"></script>
+</body>
+</html>

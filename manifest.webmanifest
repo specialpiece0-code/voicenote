@@ -1,0 +1,15 @@
+{
+  "name": "보이스노트",
+  "short_name": "보이스노트",
+  "description": "녹음·음성인식·AI 정리를 브라우저에서 처리하는 로컬 음성 노트 앱",
+  "lang": "ko",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#FFFFFF",
+  "theme_color": "#03C75A",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "maskable" }
+  ]
+}

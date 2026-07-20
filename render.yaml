@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: voicenote
+    runtime: static
+    buildCommand: ""
+    staticPublishPath: .
+    autoDeploy: true
+    headers:
+      - path: /sw.js
+        name: Cache-Control
+        value: no-cache
