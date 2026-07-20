@@ -1957,6 +1957,14 @@ VN.ui = (function () {
       viewSettings();
     };
     VN.db.setSetting('apiKey', ''); // 이전 버전의 API 키 설정값 정리
+    /* 키 입력칸에서 Enter 로도 저장되게 (버튼을 못 찾는 경우가 많아 추가) */
+    [['#st-apikey', '#st-apikey-save'], ['#ga-clientid', '#ga-clientid-save'],
+     ['#dr-url', '#dr-hook-save'], ['#dr-token', '#dr-hook-save'],
+     ['#st-dg-key', '[data-keysave="st-dg-key"]'], ['#st-aai-key', '[data-keysave="st-aai-key"]']]
+      .forEach(([input, button]) => {
+        const el = $(input), btn = $(button);
+        if (el && btn) el.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); btn.click(); } };
+      });
     /* Drive 설정 핸들러 */
     $('#dr-auto').onchange = (e) => VN.db.setSetting('driveAutoSave', e.target.checked);
     $('#dr-fmt').onchange = (e) => VN.db.setSetting('driveFormat', e.target.value);
