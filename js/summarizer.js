@@ -237,7 +237,7 @@ VN.summarizer = (function () {
     return cfg;
   }
 
-  async function runGemini(note, apiKey, model, quality) {
+  async function runGemini(note, apiKey, model, quality, onRetry) {
     model = pickModel(model);
     quality = pickQuality(quality);
     const segs = (note.segments || []).filter(s => s.text && s.text.trim());
@@ -264,21 +264,25 @@ VN.summarizer = (function () {
       '- 한국어로 답하되, 회의에서 실제로 사용된 용어와 고유명사는 그대로 유지하세요.\n\n' +
       '--- 전사 ---\n' + transcript;
 
-    const resp = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-goog-api-key': apiKey
-      },
-      body: JSON.stringify({
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        generationConfig: buildGenerationConfig(model, 0.3, quality)
-      })
+    /* 무료 등급은 혼잡할 때 503(UNAVAILABLE)/429를 자주 돌려준다. 한 번 실패했다고
+       오프라인 요약으로 내려가면 품질이 크게 떨어지므로 잠시 기다렸다 다시 시도한다. */
+    const body = JSON.stringify({
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: buildGenerationConfig(model, 0.3, quality)
     });
-    if (!resp.ok) {
-      let msg = 'API 오류 (' + resp.status + ')';
-      try { const j = await resp.json(); if (j.error && j.error.message) msg += ': ' + j.error.message; } catch (e) { /* ignore */ }
-      throw new Error(msg);
+    const headers = { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey };
+    const waits = [3000, 8000, 15000];
+    let resp, lastMsg = '';
+    for (let attempt = 0; ; attempt++) {
+      resp = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent',
+        { method: 'POST', headers: headers, body: body });
+      if (resp.ok) break;
+      lastMsg = 'API 오류 (' + resp.status + ')';
+      try { const j = await resp.json(); if (j.error && j.error.message) lastMsg += ': ' + j.error.message; } catch (e) { /* ignore */ }
+      const retryable = resp.status === 503 || resp.status === 429 || resp.status >= 500;
+      if (!retryable || attempt >= waits.length) throw new Error(lastMsg);
+      if (typeof onRetry === 'function') onRetry(attempt + 1, waits.length + 1);
+      await new Promise(r => setTimeout(r, waits[attempt]));
     }
     const data = await resp.json();
     let text = (data.candidates && data.candidates[0] && data.candidates[0].content &&
