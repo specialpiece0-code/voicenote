@@ -272,15 +272,26 @@ VN.summarizer = (function () {
     });
     const headers = { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey };
     const waits = [3000, 8000, 15000];
+    const ATTEMPT_TIMEOUT = 45000; // 응답이 없어도 버튼이 영원히 돌지 않도록 시도마다 상한을 둔다
     let resp, lastMsg = '';
     for (let attempt = 0; ; attempt++) {
-      resp = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent',
-        { method: 'POST', headers: headers, body: body });
-      if (resp.ok) break;
-      lastMsg = 'API 오류 (' + resp.status + ')';
-      try { const j = await resp.json(); if (j.error && j.error.message) lastMsg += ': ' + j.error.message; } catch (e) { /* ignore */ }
-      const retryable = resp.status === 503 || resp.status === 429 || resp.status >= 500;
-      if (!retryable || attempt >= waits.length) throw new Error(lastMsg);
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), ATTEMPT_TIMEOUT);
+      let timedOut = false;
+      try {
+        resp = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent',
+          { method: 'POST', headers: headers, body: body, signal: ctrl.signal });
+      } catch (e) {
+        if (e && e.name === 'AbortError') { timedOut = true; lastMsg = '응답이 45초 안에 오지 않았습니다.'; }
+        else { lastMsg = '네트워크 오류: ' + ((e && e.message) || e); }
+      } finally { clearTimeout(timer); }
+      if (!timedOut && resp && resp.ok) break;
+      if (!timedOut && resp) {
+        lastMsg = 'API 오류 (' + resp.status + ')';
+        try { const j = await resp.json(); if (j.error && j.error.message) lastMsg += ': ' + j.error.message; } catch (e) { /* ignore */ }
+        if (!(resp.status === 429 || resp.status >= 500)) throw new Error(lastMsg);
+      }
+      if (attempt >= waits.length) throw new Error(lastMsg);
       if (typeof onRetry === 'function') onRetry(attempt + 1, waits.length + 1);
       await new Promise(r => setTimeout(r, waits[attempt]));
     }
