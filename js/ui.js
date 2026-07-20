@@ -390,7 +390,8 @@ VN.ui = (function () {
       '<button class="icon-btn" id="btn-share" title="공유">↗</button>' +
       '<button class="icon-btn" id="btn-export" title="다운로드">⬇</button>' +
       '<button class="icon-btn" id="btn-drive-save" title="Drive 저장">☁</button>' +
-      (hasAudio ? '<button class="icon-btn" id="btn-regem" title="오디오 전체 재변환 (Gemini)">🎤</button>' : '') +
+      '<button class="icon-btn" id="btn-cal" title="📅 일정 연결">📅</button>' +
+      (hasAudio ? '<button class="icon-btn" id="btn-regem" title="오디오 전체 재변환">🎤</button>' : '') +
       '<button class="icon-btn" id="btn-del-note" title="삭제">🗑</button>' +
       '</div>' +
       '<div class="note-info">' +
@@ -398,6 +399,8 @@ VN.ui = (function () {
       '<span>⏱ ' + U.fmtTime(note.duration) + '</span>' +
       '<span>' + (LANG_LABEL[note.language] || note.language || '-') + '</span>' +
       (note.tags || []).map(t => '<span class="tag green">#' + U.esc(t) + '</span>').join('') +
+      (note.calendar && note.calendar.title ? '<span title="연결된 일정">📅 ' + U.esc(note.calendar.title) + '</span>' : '') +
+      (note.driveLink ? '<span><a href="' + U.esc(note.driveLink) + '" target="_blank" rel="noopener">Drive에서 열기 ↗</a></span>' : '') +
       '<span>📁 <select id="note-folder"><option value="">전체 노트</option>' +
       S.folders.map(f => '<option value="' + f.id + '"' + (note.folderId === f.id ? ' selected' : '') + '>' + U.esc(f.name) + '</option>').join('') +
       '</select></span>' +
@@ -463,7 +466,13 @@ VN.ui = (function () {
       } catch (e) { toast('Drive 저장 실패: ' + (e.message || e)); }
       b.disabled = false;
     };
-    if ($('#btn-regem')) $('#btn-regem').onclick = () => geminiRetranscribe(note);
+    if ($('#btn-regem')) $('#btn-regem').onclick = () => retranscribeModal(note);
+    /* 일정 연결 — 로그인/권한 없으면 조용히 버튼을 숨긴다 */
+    $('#btn-cal').onclick = () => calendarLinkModal(note);
+    VN.gcal.available().then(ok => {
+      const b = $('#btn-cal');
+      if (b && !ok) b.remove();
+    }).catch(() => { const b = $('#btn-cal'); if (b) b.remove(); });
 
     /* 플레이어 */
     if (hasAudio) {
@@ -1011,6 +1020,7 @@ VN.ui = (function () {
     if (!sttSupported) {
       html += '<div class="banner">이 브라우저는 음성인식(SpeechRecognition)을 지원하지 않아 자막 없이 녹음만 진행됩니다. (Chrome/Edge 권장)</div>';
     }
+    html += '<div id="rec-cal"></div>';
     html += '<div class="settings-row" style="justify-content:center"><label>인식 언어</label>' +
       '<select id="rec-lang">' +
       '<option value="ko-KR">한국어</option><option value="en-US">영어 (미국)</option>' +
@@ -1066,6 +1076,36 @@ VN.ui = (function () {
       });
     };
     renderSpeakers();
+
+    /* 캘린더 일정 → 제목·참석자 미리 채우기 */
+    const applyEventToRec = (ev) => {
+      if (!S.rec) return;
+      S.rec.calendar = VN.gcal.toNoteCalendar(ev);
+      S.rec.calTitle = VN.gcal.eventTitle(ev);
+      const names = VN.gcal.attendeeNames(ev);
+      if (names.length && !S.rec.active) {
+        S.rec.speakers = names.map(n => ({ name: n }));
+        S.rec.curSpeaker = 0;
+        renderSpeakers();
+      }
+    };
+
+    /* 현재시각 ±30분 일정 칩 — 로그인 안 됐거나 권한 없으면 조용히 숨김 */
+    (async () => {
+      let evs = [];
+      try { evs = await VN.gcal.currentEvents(); } catch (e) { return; }
+      const box = $('#rec-cal');
+      if (!box || !evs.length || !S.rec) return;
+      box.innerHTML = evs.map((ev, i) =>
+        '<button class="btn btn-outline btn-block" data-ev="' + i + '" style="margin-bottom:6px;text-align:left">' +
+        '📅 ' + U.esc(VN.gcal.eventTitle(ev)) + ' · 참석자 ' + VN.gcal.attendeeNames(ev).length + '명 — 이 일정으로 기록</button>'
+      ).join('');
+      $$('[data-ev]', box).forEach(b => b.onclick = () => {
+        const ev = evs[+b.dataset.ev];
+        applyEventToRec(ev);
+        box.innerHTML = '<div class="banner info">📅 ' + U.esc(VN.gcal.eventTitle(ev)) + ' 일정으로 기록합니다.</div>';
+      });
+    })();
 
     const live = $('#stt-live');
     let interimEl = null;
@@ -1219,10 +1259,12 @@ VN.ui = (function () {
     const dateStr = (d.getMonth() + 1) + '월 ' + d.getDate() + '일';
     const text = S.rec.segments.map(s => s.text).join(' ');
     const kws = text ? VN.summarizer.keywords(text, 1) : [];
-    const title = dateStr + ' ' + (kws[0] || '녹음');
+    // 캘린더 일정을 연결했으면 그 제목을 우선 사용
+    const title = S.rec.calTitle || (dateStr + ' ' + (kws[0] || '녹음'));
 
     const note = VN.db.newNote({
       title,
+      calendar: S.rec.calendar || null,
       language: S.rec.lang,
       duration: result.duration,
       audioBlob: result.blob,
@@ -1312,25 +1354,148 @@ VN.ui = (function () {
     }
   }
 
-  function transcribeChoiceModal(note) {
+  /* ── 전사 방식 선택지 (업로드 직후 / 재변환 공통) ── */
+
+  const PROVIDER_LABEL = { deepgram: 'Deepgram', assemblyai: 'AssemblyAI' };
+
+  async function diarizeReady(provider) {
+    try { return !!(VN.diarize && await VN.diarize.isConfigured(provider)); }
+    catch (e) { return false; }
+  }
+
+  /* 사용 가능 여부를 미리 조회해 비활성 처리까지 마친 옵션 버튼 HTML */
+  async function transcribeOptionsHtml() {
+    const [gem, dg, aai] = await Promise.all([
+      VN.db.getSetting('geminiApiKey', ''),
+      diarizeReady('deepgram'),
+      diarizeReady('assemblyai')
+    ]);
+    const hint = '<div class="muted small" style="margin:-4px 0 8px">설정에서 키 입력이 필요합니다.</div>';
+    return {
+      gem: !!gem, dg, aai,
+      html:
+        '<button class="btn btn-primary btn-block" data-tc="gemini" style="margin-bottom:8px"' + (gem ? '' : ' disabled') + '>✨ Gemini AI 변환 (화자 추정)</button>' +
+        (gem ? '' : '<div class="muted small" style="margin:-4px 0 8px">Gemini API 키가 없습니다. 설정 → 고급 모드에서 키를 저장하세요.</div>') +
+        '<button class="btn btn-block" data-tc="deepgram" style="margin-bottom:8px"' + (dg ? '' : ' disabled') + '>🎙 Deepgram (자동 화자분리)</button>' +
+        (dg ? '' : hint) +
+        '<button class="btn btn-block" data-tc="assemblyai" style="margin-bottom:8px"' + (aai ? '' : ' disabled') + '>🎙 AssemblyAI (자동 화자분리)</button>' +
+        (aai ? '' : hint) +
+        '<button class="btn btn-block" data-tc="whisper" style="margin-bottom:8px">🤖 Whisper AI 변환 (인터넷 필요)</button>' +
+        '<button class="btn btn-block" data-tc="manual" style="margin-bottom:8px">✍️ 수동 전사 (구간을 추가하며 직접 입력)</button>'
+    };
+  }
+
+  async function transcribeChoiceModal(note) {
+    const opt = await transcribeOptionsHtml();
     const m = modal('<h2>텍스트 변환</h2><div class="modal-body">' +
       '<p class="muted" style="margin-bottom:10px">"' + U.esc(note.title) + '" 노트를 만들었습니다. 어떻게 텍스트로 변환할까요?</p>' +
-      '<button class="btn btn-primary btn-block" id="tc-gemini" style="margin-bottom:8px">✨ Gemini AI 변환 (권장 · 화자 구분)</button>' +
-      '<div class="muted small hidden" id="tc-gemini-hint" style="margin:-4px 0 8px">Gemini API 키가 없어 사용할 수 없습니다. 설정 → 고급 모드에서 키를 저장하세요.</div>' +
-      '<button class="btn btn-block" id="tc-manual" style="margin-bottom:8px">✍️ 수동 전사 (구간을 추가하며 직접 입력)</button>' +
-      '<button class="btn btn-block" id="tc-whisper" style="margin-bottom:8px">🤖 Whisper AI 변환 (인터넷 필요)</button>' +
-      '<button class="btn btn-ghost btn-block" id="tc-later">나중에 하기</button></div>');
-    VN.db.getSetting('geminiApiKey', '').then(k => {
-      if (!k) {
-        const b = $('#tc-gemini', m), h = $('#tc-gemini-hint', m);
-        if (b) b.disabled = true;
-        if (h) h.classList.remove('hidden');
+      opt.html +
+      '<button class="btn btn-ghost btn-block" data-tc="later">나중에 하기</button></div>');
+    $$('[data-tc]', m).forEach(b => b.onclick = async () => {
+      const kind = b.dataset.tc;
+      if (kind === 'gemini') { m.remove(); geminiTranscribeModal(note); return; }
+      if (kind === 'whisper') { m.remove(); whisperModal(note); return; }
+      if (kind === 'later') { m.remove(); go('#/note/' + note.id); return; }
+      if (kind === 'manual') {
+        m.remove(); go('#/note/' + note.id);
+        toast('음성 기록 탭의 "구간 추가"로 전사를 입력하세요.');
+        return;
       }
+      // deepgram | assemblyai — 새 노트라 대체 확인은 생략
+      m.remove();
+      const ok = await diarizeTranscribe(note, kind, { confirm: false });
+      if (ok) await driveAutoSaveAfter(note);
+      go('#/note/' + note.id);
     });
-    $('#tc-gemini', m).onclick = () => { m.remove(); geminiTranscribeModal(note); };
-    $('#tc-later', m).onclick = () => { m.remove(); go('#/note/' + note.id); };
-    $('#tc-manual', m).onclick = () => { m.remove(); go('#/note/' + note.id); toast('음성 기록 탭의 "구간 추가"로 전사를 입력하세요.'); };
-    $('#tc-whisper', m).onclick = () => { m.remove(); whisperModal(note); };
+  }
+
+  /* 노트 상세 🎤: 재변환 방식 선택 */
+  async function retranscribeModal(note) {
+    if (!(note.audioBlob instanceof Blob)) { toast('오디오가 없는 노트입니다.'); return; }
+    const opt = await transcribeOptionsHtml();
+    const m = modal('<h2>오디오 전체 재변환</h2><div class="modal-body">' +
+      '<p class="muted small" style="margin-bottom:10px">오디오 전체를 다시 전사합니다. 기존 세그먼트 ' +
+      (note.segments || []).length + '개와 참석자 이름이 대체됩니다.</p>' + opt.html +
+      '</div><div class="modal-actions"><button class="btn" data-tc="cancel">취소</button></div>');
+    $$('[data-tc]', m).forEach(b => b.onclick = async () => {
+      const kind = b.dataset.tc;
+      m.remove();
+      if (kind === 'cancel') return;
+      if (kind === 'gemini') { geminiRetranscribe(note); return; }
+      if (kind === 'whisper') { whisperModal(note); return; }
+      if (kind === 'manual') { toast('음성 기록 탭의 "구간 추가"로 직접 입력하세요.'); return; }
+      const ok = await diarizeTranscribe(note, kind, { confirm: true });
+      if (ok) viewNote(note.id);
+    });
+  }
+
+  /* 화자 인덱스(0..N) → 참석자1..N 매핑 후 세그먼트 교체 — 순수 함수 */
+  function applyDiarizeSegments(note, result) {
+    const segs = (result && Array.isArray(result.segments)) ? result.segments : [];
+    let maxSp = 0;
+    for (const s of segs) maxSp = Math.max(maxSp, Math.max(0, s.speaker | 0));
+    const speakers = [];
+    for (let i = 0; i <= maxSp; i++) speakers.push({ name: '참석자 ' + (i + 1) });
+    note.speakers = speakers;
+    note.segments = segs.map(s => {
+      const start = Number(s.start) || 0;
+      const end = Number(s.end);
+      return {
+        id: U.uid(),
+        speaker: Math.max(0, s.speaker | 0),
+        start,
+        end: (isFinite(end) && end > start) ? end : start + 3,
+        text: String(s.text || ''),
+        bookmarked: false, highlighted: false
+      };
+    });
+  }
+
+  /* VN.diarize 호출 + 진행률 표시. 성공하면 true */
+  async function diarizeTranscribe(note, provider, opts) {
+    opts = opts || {};
+    const label = PROVIDER_LABEL[provider] || provider;
+    if (!(note.audioBlob instanceof Blob)) { toast('오디오가 없는 노트입니다.'); return false; }
+    if (!(await diarizeReady(provider))) {
+      toast(label + ' 키가 없습니다. 설정에서 키를 입력하세요.');
+      return false;
+    }
+    if (opts.confirm) {
+      const ok = await confirmModal('자동 화자분리 재변환 (' + label + ')',
+        '오디오 전체를 다시 전사하고 화자를 자동으로 나눕니다.<br>기존 세그먼트 ' +
+        (note.segments || []).length + '개와 참석자 이름이 <b>대체</b>됩니다.', '재변환', true);
+      if (!ok) return false;
+    }
+    const m = modal('<h2>' + U.esc(label) + ' 변환</h2><div class="modal-body">' +
+      '<div id="dz-status" class="muted small">변환 중…</div>' +
+      '<div class="progress-outer"><div class="progress-inner" id="dz-prog"></div></div></div>');
+    try {
+      const r = await VN.diarize.transcribe(note.audioBlob, {
+        provider,
+        language: note.language,
+        onProgress: (a, b) => {
+          // VN.diarize는 0~1 비율로 알린다. 0~100 형태도 함께 허용.
+          let val = 0, msg = '';
+          if (typeof a === 'number') { val = a; msg = b || ''; }
+          else if (a && typeof a === 'object') { val = Number(a.pct || a.percent || a.progress || 0); msg = a.message || a.msg || ''; }
+          if (!isFinite(val) || val < 0) val = 0;
+          const pct = val <= 1 ? val * 100 : val;
+          const p = $('#dz-prog', m), st = $('#dz-status', m);
+          if (p) p.style.width = Math.min(100, pct) + '%';
+          if (st && msg) st.textContent = msg;
+        }
+      });
+      applyDiarizeSegments(note, r);
+      await saveNote(note);
+      m.remove();
+      const cnt = (r && Array.isArray(r.segments)) ? r.segments.length : 0;
+      toast(cnt + '개 구간 · 화자 ' + (note.speakers || []).length + '명으로 변환했습니다.');
+      return true;
+    } catch (e) {
+      m.remove();
+      toast(label + ' 변환 실패: ' + ((e && e.message) || e));
+      return false;
+    }
   }
 
   function whisperModal(note) {
@@ -1444,6 +1609,45 @@ VN.ui = (function () {
     } catch (e) { toast('재변환 실패: ' + (e.message || e)); }
   }
 
+  /* ══════════════ 캘린더 일정 연결 ══════════════ */
+
+  async function calendarLinkModal(note) {
+    let evs = [];
+    try { evs = await VN.gcal.nearbyEvents(); } catch (e) { evs = []; }
+    if (!evs.length) { toast('최근 7일 ~ 앞으로 7일 사이에 일정이 없습니다.'); return; }
+    const rows = evs.map((ev, i) =>
+      '<label class="check-row" style="align-items:flex-start;gap:8px">' +
+      '<input type="radio" name="cal-ev" value="' + i + '"' + (i === 0 ? ' checked' : '') + '>' +
+      '<span class="small"><b>' + U.esc(VN.gcal.eventTitle(ev)) + '</b><br>' +
+      '<span class="muted">' + U.fmtDate(VN.gcal.eventStartMs(ev)) +
+      ' · 참석자 ' + VN.gcal.attendeeNames(ev).length + '명</span></span></label>'
+    ).join('');
+    const m = modal('<h2>📅 일정 연결</h2><div class="modal-body">' +
+      '<div style="max-height:280px;overflow:auto;margin-bottom:10px">' + rows + '</div>' +
+      '<div class="check-row"><input type="checkbox" id="cal-t" checked><label for="cal-t" class="small">노트 제목을 일정 제목으로 변경</label></div>' +
+      '<div class="check-row"><input type="checkbox" id="cal-a" checked><label for="cal-a" class="small">참석자 이름 적용</label></div>' +
+      '</div><div class="modal-actions"><button class="btn" data-x="no">취소</button>' +
+      '<button class="btn btn-primary" data-x="ok">연결</button></div>');
+    $('[data-x="no"]', m).onclick = () => m.remove();
+    $('[data-x="ok"]', m).onclick = async () => {
+      const sel = $('input[name="cal-ev"]:checked', m);
+      if (!sel) { m.remove(); return; }
+      const ev = evs[+sel.value];
+      note.calendar = VN.gcal.toNoteCalendar(ev);
+      if ($('#cal-t', m).checked) note.title = VN.gcal.eventTitle(ev);
+      if ($('#cal-a', m).checked) {
+        const names = VN.gcal.attendeeNames(ev);
+        const sp = (note.speakers || []).slice();
+        names.forEach((n, i) => { sp[i] = Object.assign({}, sp[i] || {}, { name: n }); });
+        if (sp.length) note.speakers = sp;
+      }
+      await saveNote(note);
+      m.remove();
+      toast('일정을 연결했습니다.');
+      viewNote(note.id);
+    };
+  }
+
   /* ── 노트 생성·변환 직후 Drive 자동 저장 ── */
   async function driveAutoSaveAfter(note) {
     try {
@@ -1497,7 +1701,8 @@ VN.ui = (function () {
   /* ══════════════ 설정 ══════════════ */
 
   async function viewSettings() {
-    const [lang, theme, apiKey, driveAuto, driveFormat, driveAudio, hookUrl, hookToken, driveLast, folderStatus] = await Promise.all([
+    const [lang, theme, apiKey, driveAuto, driveFormat, driveAudio, hookUrl, hookToken, driveLast, folderStatus,
+      clientId, gStatus, apiStatus, driveTarget, dgKey, aaiKey] = await Promise.all([
       VN.db.getSetting('defaultLang', 'ko-KR'),
       VN.db.getSetting('theme', 'system'),
       VN.db.getSetting('geminiApiKey', ''),
@@ -1507,7 +1712,13 @@ VN.ui = (function () {
       VN.db.getSetting('appsScriptUrl', ''),
       VN.db.getSetting('appsScriptToken', ''),
       VN.drive.getLastResult(),
-      VN.drive.getFolderStatus()
+      VN.drive.getFolderStatus(),
+      VN.gauth.getClientId(),
+      VN.gauth.status(),
+      VN.drive.getApiStatus(),
+      VN.drive.getTarget(),
+      VN.db.getSetting('deepgramApiKey', ''),
+      VN.db.getSetting('assemblyaiApiKey', '')
     ]);
     // 사용 통계
     const now = new Date();
@@ -1539,6 +1750,42 @@ VN.ui = (function () {
       '<button class="btn btn-sm btn-primary" id="st-apikey-save">저장</button>' +
       (apiKey ? '<button class="btn btn-sm" id="st-apikey-del">삭제</button>' : '') + '</div></div>';
 
+    /* ── 자동 화자분리 API 키 ── */
+    const keyRow = (id, label, val, ph) =>
+      '<div class="settings-row"><label>' + label + '</label>' +
+      '<input type="password" id="' + id + '" style="flex:1;min-width:160px" placeholder="' +
+      (val ? '저장됨 (••••' + U.esc(val.slice(-4)) + ')' : ph) + '">' +
+      '<button class="btn btn-sm btn-primary" data-keysave="' + id + '">저장</button>' +
+      (val ? '<button class="btn btn-sm" data-keydel="' + id + '">삭제</button>' : '') + '</div>';
+
+    html += '<div class="settings-group"><h2>자동 화자분리 (Deepgram / AssemblyAI)</h2>' +
+      '<p class="muted small" style="margin-bottom:8px">키를 저장하면 업로드 변환·오디오 전체 재변환에서 화자를 자동으로 나눠 전사할 수 있습니다. 키는 이 브라우저(IndexedDB)에만 저장됩니다.</p>' +
+      keyRow('st-dg-key', 'Deepgram API 키', dgKey, '키 입력') +
+      keyRow('st-aai-key', 'AssemblyAI API 키', aaiKey, '키 입력') + '</div>';
+
+    /* ── Google 계정 (OAuth) ── */
+    html += '<div class="settings-group"><h2>Google 계정 (Drive API · Calendar)</h2>' +
+      '<p class="muted small" style="margin-bottom:8px">로그인하면 Android에서도 별도 설정 없이 회의록이 Drive에 업로드되고, 캘린더 일정으로 회의 제목·참석자를 자동으로 채웁니다. 클라이언트 ID 발급 방법은 README의 "Google Cloud 콘솔 설정"을 참고하세요.</p>' +
+      '<div class="settings-row"><label>클라이언트 ID</label>' +
+      '<input type="text" id="ga-clientid" style="flex:1;min-width:200px" value="' + U.esc(clientId) + '" placeholder="…apps.googleusercontent.com">' +
+      '<button class="btn btn-sm btn-primary" id="ga-clientid-save">저장</button></div>' +
+      '<div class="settings-row"><label>상태</label>' +
+      (!gStatus.configured
+        ? '<span class="muted small">클라이언트 ID를 먼저 저장하세요.</span>'
+        : (gStatus.signedIn
+          ? '<span class="small">✅ 로그인됨' + (gStatus.email ? ' — ' + U.esc(gStatus.email) : '') + '</span>'
+          : (gStatus.hasToken
+            ? '<span class="small" style="color:var(--danger)">토큰이 만료되었습니다 — 다시 로그인해 주세요.</span>'
+            : '<span class="muted small">로그인 안 됨</span>'))) +
+      '<button class="btn btn-sm btn-primary" id="ga-signin"' + (gStatus.configured ? '' : ' disabled') + '>' +
+      (gStatus.signedIn ? '다시 로그인' : 'Google 로그인') + '</button>' +
+      (gStatus.hasToken ? '<button class="btn btn-sm" id="ga-signout">로그아웃</button>' : '') + '</div>' +
+      '<div class="settings-row"><label>Drive 폴더</label>' +
+      (apiStatus.folderName
+        ? '<span class="small">📁 ' + U.esc(apiStatus.folderName) + '</span>'
+        : '<span class="muted small">아직 확인 안 됨 (저장 시 "' + U.esc(VN.drive.FOLDER_NAME) + '" 폴더를 찾거나 만듭니다)</span>') +
+      '<button class="btn btn-sm" id="ga-refolder"' + (gStatus.configured ? '' : ' disabled') + '>폴더 다시 찾기</button></div></div>';
+
     /* ── Google Drive 자동 저장 ── */
     const APPS_SCRIPT_CODE =
       "const SECRET = 'CHANGE_ME'; // 원하는 문자열로 변경\n" +
@@ -1554,8 +1801,18 @@ VN.ui = (function () {
       "function out_(o){ return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON); }";
 
     html += '<div class="settings-group"><h2>Google Drive 자동 저장</h2>' +
-      '<p class="muted small" style="margin-bottom:8px">녹음 종료·업로드 변환 직후 회의록을 자동 저장합니다. 파일명은 <b>날짜_시각_대화주제</b>(Gemini 키 있으면 AI 주제, 없으면 키워드)로 만들어지고 노트 제목도 같은 주제로 갱신됩니다. 아래 두 경로 중 설정된 곳 <b>모두</b>에 저장됩니다.</p>' +
+      '<p class="muted small" style="margin-bottom:8px">녹음 종료·업로드 변환 직후 회의록을 자동 저장합니다. 파일명은 <b>날짜_시각_대화주제</b>(연결된 캘린더 일정 제목 우선, 없으면 Gemini 주제·키워드)로 만들어집니다. 아래에서 고른 <b>한 경로</b>에만 저장됩니다.</p>' +
       '<div class="settings-row"><label>자동 저장</label><input type="checkbox" id="dr-auto"' + (driveAuto ? ' checked' : '') + '></div>' +
+      '<div class="settings-row" style="align-items:flex-start"><label>저장 경로</label>' +
+      '<div style="display:flex;flex-direction:column;gap:6px">' +
+      [['folder', 'PC 폴더 (Google Drive for Desktop)'],
+       ['api', 'Drive API (권장 · PC/Android 공용)'],
+       ['webhook', 'Apps Script 웹훅'],
+       ['none', '사용 안 함']].map(o =>
+        '<label class="small" style="display:flex;align-items:center;gap:6px;cursor:pointer">' +
+        '<input type="radio" name="dr-target" value="' + o[0] + '"' + (driveTarget === o[0] ? ' checked' : '') + '>' +
+        o[1] + '</label>').join('') +
+      '</div></div>' +
       '<div class="settings-row"><label>파일 형식</label><select id="dr-fmt">' +
       '<option value="doc"' + (driveFormat === 'doc' ? ' selected' : '') + '>DOC (Word 호환)</option>' +
       '<option value="txt"' + (driveFormat === 'txt' ? ' selected' : '') + '>TXT (텍스트)</option></select>' +
@@ -1660,6 +1917,57 @@ VN.ui = (function () {
       await VN.db.setSetting('appsScriptUrl', $('#dr-url').value.trim());
       await VN.db.setSetting('appsScriptToken', $('#dr-token').value.trim());
       toast('웹훅 설정을 저장했습니다.');
+    };
+    $$('input[name="dr-target"]').forEach(r => r.onchange = async (e) => {
+      if (!e.target.checked) return;
+      await VN.drive.setTarget(e.target.value);
+      toast('저장 경로를 변경했습니다.');
+    });
+
+    /* 화자분리 API 키 (저장/삭제만 — 실제 호출은 VN.diarize 담당) */
+    const KEY_SETTING = { 'st-dg-key': 'deepgramApiKey', 'st-aai-key': 'assemblyaiApiKey' };
+    $$('[data-keysave]').forEach(b => b.onclick = async () => {
+      const id = b.dataset.keysave;
+      const v = $('#' + id).value.trim();
+      if (!v) { toast('키를 입력하세요.'); return; }
+      await VN.db.setSetting(KEY_SETTING[id], v);
+      toast('키를 저장했습니다.');
+      viewSettings();
+    });
+    $$('[data-keydel]').forEach(b => b.onclick = async () => {
+      await VN.db.setSetting(KEY_SETTING[b.dataset.keydel], '');
+      toast('키를 삭제했습니다.');
+      viewSettings();
+    });
+
+    /* Google 계정 */
+    $('#ga-clientid-save').onclick = async () => {
+      await VN.gauth.setClientId($('#ga-clientid').value.trim());
+      toast('클라이언트 ID를 저장했습니다.');
+      viewSettings();
+    };
+    $('#ga-signin').onclick = async () => {
+      const b = $('#ga-signin');
+      b.disabled = true; b.textContent = '로그인 중…';
+      try {
+        await VN.gauth.signIn();
+        toast('Google 계정에 로그인했습니다.');
+      } catch (e) { toast('로그인 실패: ' + ((e && e.message) || e)); }
+      viewSettings();
+    };
+    if ($('#ga-signout')) $('#ga-signout').onclick = async () => {
+      await VN.gauth.signOut();
+      toast('로그아웃했습니다.');
+      viewSettings();
+    };
+    $('#ga-refolder').onclick = async () => {
+      const b = $('#ga-refolder');
+      b.disabled = true; b.textContent = '찾는 중…';
+      try {
+        const f = await VN.drive.resolveFolder(true);
+        toast('Drive 폴더: ' + f.name);
+      } catch (e) { toast('폴더 확인 실패: ' + ((e && e.message) || e)); }
+      viewSettings();
     };
     $('#st-backup').onclick = async () => {
       const btn = $('#st-backup');

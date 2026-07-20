@@ -249,6 +249,61 @@ window.__vnDebug = {
       t('recovery.snapshot', false, String(e));
     }
 
+    // 12) Drive multipart 본문 조립 (경계 구분 + 메타데이터 JSON 파싱 가능 여부)
+    try {
+      const boundary = 'vn-test-boundary';
+      const body = VN.drive.buildMultipartBody(
+        { name: '2026-07-20_1405_회의.doc', parents: ['FOLDER1'] },
+        'application/msword', 'QUJDRA==', boundary);
+      const parts = body.split('--' + boundary);       // ['', 메타, 미디어, '--']
+      const meta = JSON.parse((parts[1] || '').split('\r\n\r\n')[1].trim());
+      const media = parts[2] || '';
+      const b64 = (media.split('\r\n\r\n')[1] || '').trim();
+      t('drive.multipartBody',
+        parts.length === 4 && body.endsWith('--' + boundary + '--') &&
+        meta.name === '2026-07-20_1405_회의.doc' && meta.parents[0] === 'FOLDER1' &&
+        media.indexOf('Content-Type: application/msword') !== -1 && atob(b64) === 'ABCD',
+        'parts=' + parts.length + ' name=' + meta.name);
+    } catch (e) { t('drive.multipartBody', false, String(e)); }
+
+    // 13) 캘린더 이벤트 → 제목/참석자 매핑 (+ 파일명 주제로 캘린더 제목 우선)
+    try {
+      const ev = {
+        id: 'ev1', summary: '  주간 제품 회의  ',
+        start: { dateTime: '2026-07-20T14:00:00+09:00' },
+        attendees: [
+          { displayName: '김팀장', email: 'kim@example.com' },
+          { email: 'lee.dev@example.com' },                                  // displayName 없음 → 로컬파트
+          { email: 'room-a@resource.calendar.google.com', resource: true }   // 회의실 제외
+        ]
+      };
+      const names = VN.gcal.attendeeNames(ev);
+      const cal = VN.gcal.toNoteCalendar(ev);
+      const topic = VN.drive.calendarTopic({ calendar: { title: '분기별 예산 검토 및 승인 회의' } });
+      t('gcal.eventMapping',
+        VN.gcal.eventTitle(ev) === '주간 제품 회의' && VN.gcal.eventTitle({}) === '(제목 없음)' &&
+        names.length === 2 && names[0] === '김팀장' && names[1] === 'lee.dev' &&
+        cal.id === 'ev1' && cal.title === '주간 제품 회의' &&
+        cal.start === Date.parse('2026-07-20T14:00:00+09:00') &&
+        topic.length > 0 && topic.length <= 15 &&
+        '분기별 예산 검토 및 승인 회의'.indexOf(topic) === 0 && VN.drive.calendarTopic({}) === '',
+        'attendees=' + names.join(',') + ' topic=' + topic);
+    } catch (e) { t('gcal.eventMapping', false, String(e)); }
+
+    // 14) 토큰 만료 판정 (발급 + expires_in − 60초)
+    try {
+      const t0 = 1700000000000;
+      const exp = VN.gauth.computeExpiry(t0, 3600);
+      const bad = VN.gauth.computeExpiry(t0, 'nope');
+      t('gauth.tokenExpiry',
+        exp === t0 + 3540000 && bad === 0 &&
+        VN.gauth.isTokenValid({ accessToken: 'x', expiresAt: exp }, t0 + 1000) === true &&
+        VN.gauth.isTokenValid({ accessToken: 'x', expiresAt: exp }, exp + 1) === false &&
+        VN.gauth.isTokenValid({ expiresAt: exp }, t0) === false &&
+        VN.gauth.isTokenValid(null, t0) === false,
+        'expiresIn=3600 → +' + ((exp - t0) / 1000) + 's');
+    } catch (e) { t('gauth.tokenExpiry', false, String(e)); }
+
     console.table(results);
     return results;
   }
