@@ -131,6 +131,89 @@ VN.ui = (function () {
     return text.split(re).map((part, i) => i % 2 ? '<mark>' + U.esc(part) + '</mark>' : U.esc(part)).join('');
   }
 
+  /* ── Wake Lock (화면 켜짐 유지 — visible 상태에서만 획득 가능) ── */
+  let wakeLockSentinel = null;
+  async function acquireWakeLock() {
+    if (!('wakeLock' in navigator)) return;
+    try { wakeLockSentinel = await navigator.wakeLock.request('screen'); } catch (e) { /* 탭이 숨김 상태면 실패 — 복귀 시 재시도 */ }
+  }
+  function releaseWakeLock() {
+    if (wakeLockSentinel) { try { wakeLockSentinel.release(); } catch (e) { /* ignore */ } wakeLockSentinel = null; }
+  }
+
+  /* ── 상단 고정 배너 (복구·Drive 권한 재승인 등) ── */
+  function showTopBanner(text, actions) {
+    const bar = document.createElement('div');
+    bar.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:999;background:var(--green,#03C75A);color:#fff;' +
+      'padding:10px 14px;display:flex;gap:10px;align-items:center;font-size:14px;flex-wrap:wrap;box-shadow:0 2px 8px rgba(0,0,0,.2)';
+    const span = document.createElement('span');
+    span.textContent = text;
+    span.style.flex = '1';
+    bar.appendChild(span);
+    for (const a of (actions || [])) {
+      const b = document.createElement('button');
+      b.textContent = a.label;
+      b.style.cssText = 'padding:6px 14px;border-radius:8px;border:none;cursor:pointer;font-weight:700;' +
+        (a.primary ? 'background:#fff;color:#02A94D' : 'background:rgba(255,255,255,.25);color:#fff');
+      b.onclick = async () => { bar.remove(); if (a.onClick) await a.onClick(); };
+      bar.appendChild(b);
+    }
+    document.body.appendChild(bar);
+    return bar;
+  }
+
+  /* ── 크래시 세이프: 잔존 녹음 세션 복구 ── */
+  async function checkRecovery() {
+    let meta = null;
+    try { meta = await VN.db.get('recChunks', 'meta'); } catch (e) { return; }
+    if (!meta) return;
+    showTopBanner('지난 녹음이 정상 종료되지 않았습니다 (' + U.fmtTime(meta.elapsed || 0) + ' 분량). 복구할까요?', [
+      { label: '지난 녹음 복구', primary: true, onClick: () => recoverSession(meta) },
+      { label: '삭제', onClick: async () => { await VN.db.clear('recChunks'); toast('복구 데이터를 삭제했습니다.'); } }
+    ]);
+  }
+
+  async function recoverSession(meta) {
+    try {
+      const all = await VN.db.getAll('recChunks');
+      const blob = VN.recorder.assembleChunks(all.filter(r => r.id !== 'meta'));
+      const d = new Date(meta.updatedAt || Date.now());
+      const note = VN.db.newNote({
+        title: (d.getMonth() + 1) + '월 ' + d.getDate() + '일 복구된 녹음',
+        language: meta.lang || 'ko-KR',
+        duration: meta.elapsed || 0,
+        audioBlob: blob.size ? blob : null,
+        audioType: meta.mimeType || 'audio/webm',
+        sourceType: 'record',
+        speakers: meta.speakers || [{ name: '참석자 1' }],
+        segments: meta.segments || [],
+        memos: meta.memos || [],
+        bookmarks: meta.bookmarks || []
+      });
+      await VN.db.saveNote(note);
+      await VN.db.clear('recChunks');
+      toast('지난 녹음을 복구했습니다.');
+      go('#/note/' + note.id);
+    } catch (e) { toast('복구 실패: ' + (e.message || e)); }
+  }
+
+  /* ── Drive 폴더 권한 재승인 배너 ── */
+  async function checkDrivePermission() {
+    try {
+      const st = await VN.drive.getFolderStatus();
+      if (st.supported && st.name && st.permission === 'prompt') {
+        showTopBanner('Drive 저장 폴더("' + st.name + '") 접근 재승인이 필요합니다.', [
+          {
+            label: '재승인', primary: true, onClick: async () => {
+              const p = await VN.drive.requestFolderPermission();
+              toast(p === 'granted' ? '폴더 접근이 승인되었습니다.' : '승인되지 않았습니다. 설정에서 다시 시도하세요.');
+            }
+          }
+        ]);
+      }
+    } catch (e) { /* ignore */ }
+  }
+
   /* ══════════════ 라우팅 ══════════════ */
 
   async function route() {
@@ -306,6 +389,8 @@ VN.ui = (function () {
       '<button class="icon-btn' + (note.favorite ? ' on' : '') + '" id="btn-fav" title="즐겨찾기">' + (note.favorite ? '★' : '☆') + '</button>' +
       '<button class="icon-btn" id="btn-share" title="공유">↗</button>' +
       '<button class="icon-btn" id="btn-export" title="다운로드">⬇</button>' +
+      '<button class="icon-btn" id="btn-drive-save" title="Drive 저장">☁</button>' +
+      (hasAudio ? '<button class="icon-btn" id="btn-regem" title="오디오 전체 재변환 (Gemini)">🎤</button>' : '') +
       '<button class="icon-btn" id="btn-del-note" title="삭제">🗑</button>' +
       '</div>' +
       '<div class="note-info">' +
@@ -367,6 +452,18 @@ VN.ui = (function () {
     };
     $('#btn-share').onclick = () => shareModal(note);
     $('#btn-export').onclick = () => exportModal(note);
+    $('#btn-drive-save').onclick = async () => {
+      const b = $('#btn-drive-save');
+      b.disabled = true;
+      toast('Drive 저장 중…');
+      try {
+        const r = await VN.drive.saveNoteToDrive(note);
+        toast(r.message || (r.saved ? 'Drive에 저장했습니다.' : 'Drive 저장을 건너뛰었습니다.'));
+        if (r.titleChanged && $('#note-title')) $('#note-title').value = note.title;
+      } catch (e) { toast('Drive 저장 실패: ' + (e.message || e)); }
+      b.disabled = false;
+    };
+    if ($('#btn-regem')) $('#btn-regem').onclick = () => geminiRetranscribe(note);
 
     /* 플레이어 */
     if (hasAudio) {
@@ -918,6 +1015,7 @@ VN.ui = (function () {
       '<select id="rec-lang">' +
       '<option value="ko-KR">한국어</option><option value="en-US">영어 (미국)</option>' +
       '<option value="ja-JP">일본어</option><option value="zh-CN">중국어 (간체)</option></select></div>' +
+      '<div class="check-row" id="rec-wl-row" style="justify-content:center"><input type="checkbox" id="rec-wakelock"><label for="rec-wakelock" class="small">화면 켜짐 유지 (Wake Lock)</label></div>' +
       '<div class="record-timer" id="rec-timer">00:00</div>' +
       '<div class="record-state" id="rec-state">녹음 대기 중</div>' +
       '<canvas id="record-wave" width="640" height="90"></canvas>' +
@@ -925,6 +1023,7 @@ VN.ui = (function () {
       '<button class="btn btn-primary" id="rec-start"' + (recSupported ? '' : ' disabled') + '>● 녹음 시작</button>' +
       '</div>' +
       '<div class="speaker-tabs" id="rec-speakers"></div>' +
+      '<div id="rec-warn"></div>' +
       '<div class="stt-live" id="stt-live"><span class="faint">녹음을 시작하면 실시간 자막이 여기에 표시됩니다.</span></div>' +
       '<div class="record-memo-row">' +
       '<button class="icon-btn" id="rec-bookmark" title="현재 시점 북마크" disabled>🔖</button>' +
@@ -934,11 +1033,22 @@ VN.ui = (function () {
 
     VN.db.getSetting('defaultLang', 'ko-KR').then(l => { $('#rec-lang') && ($('#rec-lang').value = l); });
 
+    // Wake Lock 옵션 (미지원 브라우저는 숨김)
+    if (!('wakeLock' in navigator)) {
+      $('#rec-wl-row').classList.add('hidden');
+    } else {
+      VN.db.getSetting('wakeLock', false).then(v => { const c = $('#rec-wakelock'); if (c) c.checked = !!v; });
+      $('#rec-wakelock').onchange = (e) => {
+        VN.db.setSetting('wakeLock', e.target.checked);
+        if (S.rec && S.rec.active) { if (e.target.checked) acquireWakeLock(); else releaseWakeLock(); }
+      };
+    }
+
     S.rec = {
       active: false, lang: 'ko-KR',
       segments: [], memos: [], bookmarks: [],
       speakers: [{ name: '참석자 1' }, { name: '참석자 2' }, { name: '참석자 3' }],
-      curSpeaker: 0, timerId: null
+      curSpeaker: 0, timerId: null, sttWarned: false
     };
 
     const renderSpeakers = () => {
@@ -983,9 +1093,13 @@ VN.ui = (function () {
     };
 
     const startTimer = () => {
+      // UI 갱신 전용 — 경과시간 데이터는 VN.recorder.currentTime()(Date.now 기반)이 진실.
       S.rec.timerId = setInterval(() => {
+        const cur = U.fmtTime(VN.recorder.currentTime());
         const t = $('#rec-timer');
-        if (t) t.textContent = U.fmtTime(VN.recorder.currentTime());
+        if (t) t.textContent = cur;
+        // 탭 숨김 중에도 1분 간격으로는 동작 → 제목으로 진행 상황 표시
+        if (S.rec && S.rec.active) document.title = '● ' + cur + ' 녹음 중 — 보이스노트';
       }, 250);
     };
 
@@ -1019,6 +1133,8 @@ VN.ui = (function () {
           VN.recorder.cancel();
           clearInterval(S.rec.timerId);
           S.rec.active = false;
+          releaseWakeLock();
+          document.title = '보이스노트';
           go('#/list');
         }
       };
@@ -1028,12 +1144,26 @@ VN.ui = (function () {
       S.rec.lang = $('#rec-lang').value;
       VN.db.setSetting('defaultLang', S.rec.lang);
       try {
-        await VN.recorder.start({ canvas: $('#record-wave') });
+        await VN.recorder.start({
+          canvas: $('#record-wave'),
+          // 크래시 세이프: 5초마다 청크+메타 스냅샷을 IndexedDB recChunks에 flush
+          persist: {
+            getMeta: () => ({
+              lang: S.rec.lang,
+              speakers: S.rec.speakers,
+              segments: S.rec.segments,
+              memos: S.rec.memos,
+              bookmarks: S.rec.bookmarks
+            })
+          }
+        });
       } catch (e) {
         toast('녹음을 시작할 수 없습니다: ' + (e.message || e));
         return;
       }
       S.rec.active = true;
+      S.rec.sttWarned = false;
+      if ($('#rec-wakelock') && $('#rec-wakelock').checked) acquireWakeLock();
       live.innerHTML = '';
       interimEl = null;
       $('#rec-lang').disabled = true;
@@ -1075,6 +1205,8 @@ VN.ui = (function () {
     S.rec.active = false;
     VN.stt.stop();
     clearInterval(S.rec.timerId);
+    releaseWakeLock();
+    document.title = '보이스노트';
     let result;
     try {
       result = await VN.recorder.stop();
@@ -1103,7 +1235,11 @@ VN.ui = (function () {
       waveform: result.waveform
     });
     await VN.db.saveNote(note);
+    // 노트가 안전하게 저장됐으니 크래시 세이프 청크 정리
+    try { await VN.db.clear('recChunks'); } catch (e) { /* ignore */ }
     S.rec = null;
+    // Drive 자동 저장 (주제 생성 → 파일명·노트 제목 확정 → 활성 경로 전부 저장)
+    await driveAutoSaveAfter(note);
     if (!silent) {
       toast('노트가 생성되었습니다.');
       go('#/note/' + note.id);
@@ -1179,9 +1315,19 @@ VN.ui = (function () {
   function transcribeChoiceModal(note) {
     const m = modal('<h2>텍스트 변환</h2><div class="modal-body">' +
       '<p class="muted" style="margin-bottom:10px">"' + U.esc(note.title) + '" 노트를 만들었습니다. 어떻게 텍스트로 변환할까요?</p>' +
+      '<button class="btn btn-primary btn-block" id="tc-gemini" style="margin-bottom:8px">✨ Gemini AI 변환 (권장 · 화자 구분)</button>' +
+      '<div class="muted small hidden" id="tc-gemini-hint" style="margin:-4px 0 8px">Gemini API 키가 없어 사용할 수 없습니다. 설정 → 고급 모드에서 키를 저장하세요.</div>' +
       '<button class="btn btn-block" id="tc-manual" style="margin-bottom:8px">✍️ 수동 전사 (구간을 추가하며 직접 입력)</button>' +
       '<button class="btn btn-block" id="tc-whisper" style="margin-bottom:8px">🤖 Whisper AI 변환 (인터넷 필요)</button>' +
       '<button class="btn btn-ghost btn-block" id="tc-later">나중에 하기</button></div>');
+    VN.db.getSetting('geminiApiKey', '').then(k => {
+      if (!k) {
+        const b = $('#tc-gemini', m), h = $('#tc-gemini-hint', m);
+        if (b) b.disabled = true;
+        if (h) h.classList.remove('hidden');
+      }
+    });
+    $('#tc-gemini', m).onclick = () => { m.remove(); geminiTranscribeModal(note); };
     $('#tc-later', m).onclick = () => { m.remove(); go('#/note/' + note.id); };
     $('#tc-manual', m).onclick = () => { m.remove(); go('#/note/' + note.id); toast('음성 기록 탭의 "구간 추가"로 전사를 입력하세요.'); };
     $('#tc-whisper', m).onclick = () => { m.remove(); whisperModal(note); };
@@ -1223,6 +1369,7 @@ VN.ui = (function () {
         await saveNote(note);
         toast(segs.length + '개 구간을 변환했습니다.');
         m.remove();
+        await driveAutoSaveAfter(note);
         go('#/note/' + note.id);
       } catch (e) {
         const st = $('#wh-status', m);
@@ -1230,6 +1377,81 @@ VN.ui = (function () {
         btn.disabled = false;
       }
     };
+  }
+
+  /* ══════════════ Gemini 오디오 전사 ══════════════ */
+
+  /* Gemini 전사 결과 → 노트 세그먼트·참석자 적용 (기존 세그먼트 대체) */
+  function applyGeminiSegments(note, items) {
+    const labels = [];
+    for (const it of items) if (!labels.includes(it.speakerLabel)) labels.push(it.speakerLabel);
+    if (!labels.length) labels.push('참석자 1');
+    note.speakers = labels.map(l => ({ name: l }));
+    note.segments = items.map((it, i) => ({
+      id: U.uid(),
+      speaker: Math.max(0, labels.indexOf(it.speakerLabel)),
+      start: it.start,
+      end: items[i + 1] ? Math.max(it.start, items[i + 1].start) : it.start + 3,
+      text: it.text,
+      bookmarked: false, highlighted: false
+    }));
+  }
+
+  /* 업로드 변환 모달의 Gemini 경로 */
+  function geminiTranscribeModal(note) {
+    const m = modal('<h2>Gemini AI 변환</h2><div class="modal-body">' +
+      '<p class="muted small" style="margin-bottom:10px">오디오 전체를 Gemini 2.5 Flash에 보내 화자 추정과 함께 전사합니다. (오디오 18MB 이하, 인터넷 필요)</p>' +
+      '<div id="gm-status" class="muted small">준비됨</div>' +
+      '</div><div class="modal-actions"><button class="btn" data-x="no">닫기</button>' +
+      '<button class="btn btn-primary" id="gm-go">변환 시작</button></div>');
+    $('[data-x="no"]', m).onclick = () => { m.remove(); go('#/note/' + note.id); };
+    $('#gm-go', m).onclick = async () => {
+      const btn = $('#gm-go', m);
+      btn.disabled = true;
+      $('#gm-status', m).textContent = '변환 중… (오디오 길이에 따라 수십 초 걸릴 수 있습니다)';
+      try {
+        const items = await VN.summarizer.transcribeAudioGemini(note.audioBlob, { language: note.language });
+        applyGeminiSegments(note, items);
+        await saveNote(note);
+        toast(items.length + '개 발화를 변환했습니다.');
+        m.remove();
+        await driveAutoSaveAfter(note);
+        go('#/note/' + note.id);
+      } catch (e) {
+        const st = $('#gm-status', m);
+        if (st) st.innerHTML = '<span style="color:var(--danger)">' + U.esc(e.message || String(e)) + '</span>';
+        btn.disabled = false;
+      }
+    };
+  }
+
+  /* 노트 상세: 오디오 전체 재변환 (기존 세그먼트 대체 전 확인) */
+  async function geminiRetranscribe(note) {
+    const key = await VN.db.getSetting('geminiApiKey', '');
+    if (!key) { toast('Gemini API 키가 없습니다. 설정 → 고급 모드에서 저장하세요.'); return; }
+    if (!(note.audioBlob instanceof Blob)) { toast('오디오가 없는 노트입니다.'); return; }
+    const n = (note.segments || []).length;
+    const ok = await confirmModal('오디오 전체 재변환 (Gemini)',
+      '오디오 전체를 Gemini로 다시 전사합니다.<br>기존 세그먼트 ' + n + '개와 참석자 이름이 <b>대체</b>됩니다.', '재변환', true);
+    if (!ok) return;
+    toast('Gemini 재변환 중… (수십 초 걸릴 수 있습니다)');
+    try {
+      const items = await VN.summarizer.transcribeAudioGemini(note.audioBlob, { language: note.language });
+      applyGeminiSegments(note, items);
+      await saveNote(note);
+      toast(items.length + '개 발화로 재변환했습니다.');
+      viewNote(note.id);
+    } catch (e) { toast('재변환 실패: ' + (e.message || e)); }
+  }
+
+  /* ── 노트 생성·변환 직후 Drive 자동 저장 ── */
+  async function driveAutoSaveAfter(note) {
+    try {
+      const r = await VN.drive.autoSave(note);
+      if (r && r.saved) toast('Drive 저장 완료: ' + (r.filename || ''));
+      else if (r && !r.skipped && r.message) toast(r.message);
+      return r;
+    } catch (e) { toast('Drive 자동 저장 실패: ' + (e.message || e)); }
   }
 
   /* ══════════════ 휴지통 ══════════════ */
@@ -1275,10 +1497,17 @@ VN.ui = (function () {
   /* ══════════════ 설정 ══════════════ */
 
   async function viewSettings() {
-    const [lang, theme, apiKey] = await Promise.all([
+    const [lang, theme, apiKey, driveAuto, driveFormat, driveAudio, hookUrl, hookToken, driveLast, folderStatus] = await Promise.all([
       VN.db.getSetting('defaultLang', 'ko-KR'),
       VN.db.getSetting('theme', 'system'),
-      VN.db.getSetting('geminiApiKey', '')
+      VN.db.getSetting('geminiApiKey', ''),
+      VN.db.getSetting('driveAutoSave', true),
+      VN.db.getSetting('driveFormat', 'doc'),
+      VN.db.getSetting('driveAudio', false),
+      VN.db.getSetting('appsScriptUrl', ''),
+      VN.db.getSetting('appsScriptToken', ''),
+      VN.drive.getLastResult(),
+      VN.drive.getFolderStatus()
     ]);
     // 사용 통계
     const now = new Date();
@@ -1309,6 +1538,53 @@ VN.ui = (function () {
       '<input type="password" id="st-apikey" style="flex:1;min-width:160px" placeholder="' + (apiKey ? '저장됨 (••••' + apiKey.slice(-4) + ')' : 'AIza…') + '">' +
       '<button class="btn btn-sm btn-primary" id="st-apikey-save">저장</button>' +
       (apiKey ? '<button class="btn btn-sm" id="st-apikey-del">삭제</button>' : '') + '</div></div>';
+
+    /* ── Google Drive 자동 저장 ── */
+    const APPS_SCRIPT_CODE =
+      "const SECRET = 'CHANGE_ME'; // 원하는 문자열로 변경\n" +
+      "function doPost(e) {\n" +
+      "  const d = JSON.parse(e.postData.contents);\n" +
+      "  if (d.token !== SECRET) return out_({ok:false, error:'bad token'});\n" +
+      "  const folder = folder_('회의록');\n" +
+      "  const blob = Utilities.newBlob(Utilities.base64Decode(d.dataBase64), d.mimeType || 'application/octet-stream', d.filename);\n" +
+      "  const f = folder.createFile(blob);\n" +
+      "  return out_({ok:true, id:f.getId(), url:f.getUrl()});\n" +
+      "}\n" +
+      "function folder_(name){ const it = DriveApp.getFoldersByName(name); return it.hasNext() ? it.next() : DriveApp.createFolder(name); }\n" +
+      "function out_(o){ return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON); }";
+
+    html += '<div class="settings-group"><h2>Google Drive 자동 저장</h2>' +
+      '<p class="muted small" style="margin-bottom:8px">녹음 종료·업로드 변환 직후 회의록을 자동 저장합니다. 파일명은 <b>날짜_시각_대화주제</b>(Gemini 키 있으면 AI 주제, 없으면 키워드)로 만들어지고 노트 제목도 같은 주제로 갱신됩니다. 아래 두 경로 중 설정된 곳 <b>모두</b>에 저장됩니다.</p>' +
+      '<div class="settings-row"><label>자동 저장</label><input type="checkbox" id="dr-auto"' + (driveAuto ? ' checked' : '') + '></div>' +
+      '<div class="settings-row"><label>파일 형식</label><select id="dr-fmt">' +
+      '<option value="doc"' + (driveFormat === 'doc' ? ' selected' : '') + '>DOC (Word 호환)</option>' +
+      '<option value="txt"' + (driveFormat === 'txt' ? ' selected' : '') + '>TXT (텍스트)</option></select>' +
+      '<span class="check-row" style="margin:0"><input type="checkbox" id="dr-audio"' + (driveAudio ? ' checked' : '') + '><label for="dr-audio" class="small">오디오(webm)도 함께 저장</label></span></div>';
+    if (folderStatus.supported) {
+      html += '<div class="settings-row"><label>PC 저장 폴더</label>' +
+        (folderStatus.name
+          ? '<span class="small">📁 ' + U.esc(folderStatus.name) + (folderStatus.permission === 'granted' ? '' : ' <span style="color:var(--danger)">(재승인 필요)</span>') + '</span>'
+          : '<span class="muted small">선택 안 됨 — 예: G:\\내 드라이브\\회의록</span>') +
+        '<button class="btn btn-sm" id="dr-pick">PC 저장 폴더 선택</button>' +
+        (folderStatus.name && folderStatus.permission !== 'granted' ? '<button class="btn btn-sm btn-primary" id="dr-perm">재승인</button>' : '') +
+        (folderStatus.name ? '<button class="btn btn-sm" id="dr-unpick">해제</button>' : '') +
+        '</div>';
+    } else {
+      html += '<p class="muted small">이 브라우저는 PC 폴더 저장(File System Access API)을 지원하지 않습니다. Android에서는 아래 Apps Script 웹훅을 사용하세요.</p>';
+    }
+    html += '<div class="settings-row"><label>Apps Script URL</label><input type="text" id="dr-url" style="flex:1;min-width:160px" value="' + U.esc(hookUrl) + '" placeholder="https://script.google.com/macros/s/…/exec"></div>' +
+      '<div class="settings-row"><label>비밀 토큰</label><input type="password" id="dr-token" style="flex:1;min-width:120px" value="' + U.esc(hookToken) + '" placeholder="Apps Script의 SECRET 값">' +
+      '<button class="btn btn-sm btn-primary" id="dr-hook-save">저장</button></div>' +
+      '<div class="muted small" id="dr-last" style="margin-top:4px">' +
+      (driveLast ? '마지막 저장: ' + U.fmtDate(driveLast.time) + ' — ' + (driveLast.ok ? '✅ ' : '⚠️ ') + U.esc(driveLast.message || '') : '아직 저장 이력이 없습니다.') + '</div>' +
+      '<details style="margin-top:10px"><summary style="cursor:pointer;font-weight:600">Apps Script 웹훅 설정 방법 (Android·클라우드 직접 업로드)</summary>' +
+      '<div class="muted small" style="line-height:1.8;margin-top:6px">' +
+      '1. <b>script.google.com</b> → 새 프로젝트 → 아래 코드 붙여넣기 (SECRET을 원하는 문자열로 변경)<br>' +
+      '2. 배포 → <b>새 배포</b> → 유형: <b>웹 앱</b> → 실행: <b>나</b> → 액세스: <b>링크가 있는 모든 사용자</b> → 배포<br>' +
+      '3. 웹 앱 <b>URL 복사</b> → 위 "Apps Script URL"에 붙여넣고, SECRET 값을 "비밀 토큰"에 입력 후 저장<br>' +
+      '· 회의록은 내 Drive의 <b>회의록</b> 폴더에 저장됩니다. 전송 실패 시 재시도 큐에 보관했다가 앱 시작 시 다시 보냅니다. 18MB 초과 페이로드는 건너뜁니다.</div>' +
+      '<pre style="overflow:auto;background:var(--bg-hover);padding:10px;border-radius:8px;font-size:11px;line-height:1.5;margin-top:8px">' + U.esc(APPS_SCRIPT_CODE) + '</pre>' +
+      '</details></div>';
 
     html += '<div class="settings-group"><h2>데이터 관리</h2>' +
       '<div class="settings-row"><label>전체 백업</label>' +
@@ -1359,6 +1635,32 @@ VN.ui = (function () {
       viewSettings();
     };
     VN.db.setSetting('apiKey', ''); // 이전 버전의 API 키 설정값 정리
+    /* Drive 설정 핸들러 */
+    $('#dr-auto').onchange = (e) => VN.db.setSetting('driveAutoSave', e.target.checked);
+    $('#dr-fmt').onchange = (e) => VN.db.setSetting('driveFormat', e.target.value);
+    $('#dr-audio').onchange = (e) => VN.db.setSetting('driveAudio', e.target.checked);
+    if ($('#dr-pick')) $('#dr-pick').onclick = async () => {
+      try {
+        const name = await VN.drive.pickFolder();
+        toast('저장 폴더를 설정했습니다: ' + name);
+        viewSettings();
+      } catch (e) { if (!e || e.name !== 'AbortError') toast('폴더 선택 실패: ' + ((e && e.message) || e)); }
+    };
+    if ($('#dr-perm')) $('#dr-perm').onclick = async () => {
+      const p = await VN.drive.requestFolderPermission();
+      toast(p === 'granted' ? '폴더 접근이 승인되었습니다.' : '승인되지 않았습니다.');
+      viewSettings();
+    };
+    if ($('#dr-unpick')) $('#dr-unpick').onclick = async () => {
+      await VN.drive.clearFolder();
+      toast('저장 폴더를 해제했습니다.');
+      viewSettings();
+    };
+    $('#dr-hook-save').onclick = async () => {
+      await VN.db.setSetting('appsScriptUrl', $('#dr-url').value.trim());
+      await VN.db.setSetting('appsScriptToken', $('#dr-token').value.trim());
+      toast('웹훅 설정을 저장했습니다.');
+    };
     $('#st-backup').onclick = async () => {
       const btn = $('#st-backup');
       btn.disabled = true; btn.textContent = '만드는 중…';
@@ -1453,6 +1755,31 @@ VN.ui = (function () {
       if (overlay) { overlay.remove(); overlay = null; }
       if (e.dataTransfer.files.length) importFiles(e.dataTransfer.files);
     });
+
+    // 녹음 중 새로고침·닫기 확인
+    window.addEventListener('beforeunload', (e) => {
+      if (S.rec && S.rec.active) { e.preventDefault(); e.returnValue = ''; }
+    });
+
+    // 탭 복귀: Wake Lock 재획득 + 백그라운드 STT 중단 감지.
+    // 캡처 관련(MediaRecorder·STT·flush)은 여기서 아무것도 멈추지 않는다.
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState !== 'visible' || !S.rec || !S.rec.active) return;
+      const wl = $('#rec-wakelock');
+      if (wl && wl.checked) acquireWakeLock();
+      if (VN.stt.supported && !S.rec.sttWarned && Date.now() - VN.stt.lastResultAt() > 60000) {
+        S.rec.sttWarned = true;
+        const warn = $('#rec-warn');
+        if (warn) warn.innerHTML = '<div class="banner">백그라운드 동안 음성인식이 일부 중단됐을 수 있습니다. 녹음은 계속 저장되고 있으니, 저장 후 노트에서 "오디오 전체 재변환(Gemini)"으로 전체를 다시 전사할 수 있습니다.</div>';
+      }
+    });
+
+    // 크래시 복구·Drive 권한 배너·웹훅 재시도 큐
+    checkRecovery();
+    checkDrivePermission();
+    VN.drive.flushRetryQueue().then(r => {
+      if (r.sent) toast('대기 중이던 Drive 웹훅 ' + r.sent + '건을 전송했습니다.');
+    }).catch(() => { /* ignore */ });
 
     window.addEventListener('hashchange', route);
     await route();

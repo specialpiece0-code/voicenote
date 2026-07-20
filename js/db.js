@@ -60,7 +60,7 @@ VN.util = {
 /* ── IndexedDB ────────────────────────── */
 VN.db = (function () {
   const DB_NAME = 'voicenote';
-  const DB_VER = 1;
+  const DB_VER = 2; // v2: recChunks (녹음 크래시 세이프 청크·메타)
   const TRASH_KEEP_MS = 30 * 24 * 60 * 60 * 1000; // 30일
   let _db = null;
 
@@ -74,9 +74,18 @@ VN.db = (function () {
         if (!db.objectStoreNames.contains('folders')) db.createObjectStore('folders', { keyPath: 'id' });
         if (!db.objectStoreNames.contains('trash')) db.createObjectStore('trash', { keyPath: 'id' });
         if (!db.objectStoreNames.contains('settings')) db.createObjectStore('settings', { keyPath: 'key' });
+        if (!db.objectStoreNames.contains('recChunks')) db.createObjectStore('recChunks', { keyPath: 'id' });
       };
-      req.onsuccess = () => { _db = req.result; res(_db); };
+      req.onsuccess = () => {
+        _db = req.result;
+        // 다른 탭이 상위 버전으로 업그레이드하려 할 때 연결을 닫아 차단을 방지
+        _db.onversionchange = () => { try { _db.close(); } catch (e) { /* ignore */ } _db = null; };
+        res(_db);
+      };
       req.onerror = () => rej(req.error);
+      req.onblocked = () => {
+        console.warn('IndexedDB 업그레이드가 다른 탭에 의해 차단됨 — 이 앱을 연 다른 탭을 닫아주세요.');
+      };
     });
   }
 

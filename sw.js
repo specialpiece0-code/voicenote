@@ -1,6 +1,6 @@
 /* 보이스노트 서비스 워커 — network-first (절대 stale 캐시를 우선하지 않음)
    네트워크 성공 시 캐시 갱신, 실패(오프라인) 시에만 캐시 폴백. */
-const CACHE = 'voicenote-v2';
+const CACHE = 'voicenote-v3';
 
 self.addEventListener('install', (e) => {
   self.skipWaiting();

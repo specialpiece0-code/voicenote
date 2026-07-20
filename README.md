@@ -62,6 +62,67 @@
 | 클라우드 동기화 | **백업/복원으로 대체**: 전체 백업(.json, 오디오 포함 옵션) → 다른 기기에서 가져오기 |
 | 앱 설치 | PWA(manifest + service worker, network-first 캐시) |
 
+## 회의록 Google Drive 자동 저장
+
+녹음 종료·업로드 변환 직후 회의록(DOC/TXT)을 자동으로 저장합니다.
+파일명은 `YYYY-MM-DD_HHmm_<대화주제>.doc` — 주제는 Gemini 키가 있으면 AI가 15자 이내로 생성하고,
+없거나 실패하면 로컬 키워드 상위 2개로 만듭니다. 노트 제목도 같은 주제로 갱신됩니다.
+설정에서 자동 저장 온/오프, DOC/TXT 형식, "오디오(webm)도 함께 저장", 마지막 저장 결과를 관리하고,
+노트 상세의 ☁ 버튼으로 언제든 수동 재저장(같은 파일명 유지)할 수 있습니다.
+
+두 경로를 함께 또는 따로 쓸 수 있습니다.
+
+### ① PC 폴더 저장 (PC Chrome — Google Drive for Desktop)
+
+1. 설정 → Google Drive 자동 저장 → **PC 저장 폴더 선택** → `G:\내 드라이브\회의록` 선택.
+2. 폴더 핸들은 브라우저(IndexedDB)에 저장됩니다. 브라우저 재시작 후 권한이 풀리면
+   상단 배너의 **재승인** 버튼(사용자 클릭 필요)으로 다시 허용하세요.
+3. 같은 파일명이 이미 있으면 ` (2)` 를 붙여 저장합니다. 수동 재저장은 기존 파일을 덮어씁니다.
+4. Android Chrome은 이 API를 지원하지 않아 버튼이 숨겨집니다 — 아래 웹훅을 사용하세요.
+
+### ② Apps Script 웹훅 (Android·클라우드 직접 업로드)
+
+1. [script.google.com](https://script.google.com) → 새 프로젝트 → 아래 코드 붙여넣기
+   (`SECRET`을 원하는 문자열로 변경):
+
+```javascript
+const SECRET = 'CHANGE_ME'; // 원하는 문자열로 변경
+function doPost(e) {
+  const d = JSON.parse(e.postData.contents);
+  if (d.token !== SECRET) return out_({ok:false, error:'bad token'});
+  const folder = folder_('회의록');
+  const blob = Utilities.newBlob(Utilities.base64Decode(d.dataBase64), d.mimeType || 'application/octet-stream', d.filename);
+  const f = folder.createFile(blob);
+  return out_({ok:true, id:f.getId(), url:f.getUrl()});
+}
+function folder_(name){ const it = DriveApp.getFoldersByName(name); return it.hasNext() ? it.next() : DriveApp.createFolder(name); }
+function out_(o){ return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON); }
+```
+
+2. 배포 → **새 배포** → 유형: **웹 앱** → 실행: **나** → 액세스: **링크가 있는 모든 사용자** → 배포 → **URL 복사**.
+3. 보이스노트 설정에 URL과 SECRET(비밀 토큰)을 입력·저장.
+4. 회의록은 내 Drive의 `회의록` 폴더에 저장됩니다. 전송은 커스텀 헤더 없는 text/plain POST(단순 요청)라
+   CORS preflight가 없습니다. 실패하면 재시도 큐(IndexedDB)에 보관했다가 앱 시작 시 다시 보내고,
+   18MB 초과 페이로드는 건너뛰고 알립니다. 웹훅 경로의 재저장은 Drive에 새 파일로 생성됩니다(덮어쓰기 없음).
+
+## 백그라운드 녹음·크래시 복구
+
+- 경과시간·세그먼트 타임스탬프는 `Date.now()` 절대시각 차(일시정지 차감)로 계산 — 탭이 백그라운드로
+  가도 시간이 밀리지 않습니다. 화면 타이머·파형은 UI 전용입니다.
+- 녹음 중 1초 단위 청크와 메타(세그먼트·메모·북마크·경과시간)를 5초마다 IndexedDB에 저장합니다.
+  브라우저가 죽어도 다음 실행 시 **"지난 녹음 복구"** 배너로 노트를 되살릴 수 있습니다.
+- 음성인식은 끊기면 자동 재시작하며, 백그라운드에서 60초 이상 결과가 없었으면 복귀 시 경고 배너를
+  띄웁니다(이 경우 노트에서 "오디오 전체 재변환(Gemini)"으로 전체 재전사 가능).
+- 녹음 중 탭 제목이 `● mm:ss 녹음 중`으로 갱신되고, 화면 켜짐 유지(Wake Lock) 옵션과
+  녹음 중 새로고침/닫기 확인 대화상자를 제공합니다.
+
+## Gemini 오디오 전사
+
+Gemini API 키가 있으면 오디오(≤18MB)를 `gemini-2.5-flash`에 직접 보내 화자 추정 라벨과
+시작 시각이 붙은 전사를 받습니다. ① 파일 업로드 후 "Gemini AI 변환(권장)" ② 노트 상세의
+🎤 버튼("오디오 전체 재변환") — 기존 세그먼트를 대체하기 전에 확인을 받습니다.
+18MB 초과 오디오는 분할하지 않고 안내만 하며, 이때는 Whisper 변환을 사용하세요.
+
 ## 제한사항
 
 - **자동 화자 분리 없음** — 브라우저에는 화자분리 API가 없어 녹음 중 참석자 탭을 수동으로 전환합니다.
@@ -93,5 +154,5 @@ A. 설정에 Gemini API 키를 입력하면 고급 모드(Gemini 2.5 Flash)로 �
 ## 개발 메모
 
 - 프레임워크/빌드 도구/npm 없음. `js/*.js`가 전역 네임스페이스 `VN.*`로 로드 순서 고정.
-- 콘솔 테스트 훅: `window.__vnDebug.runSelfTest()` — 요약기·SRT/TXT·검색·바꾸기·DB CRUD·백업 직렬화를 실제 실행해 `{name, pass, detail}[]` 반환.
+- 콘솔 테스트 훅: `window.__vnDebug.runSelfTest()` — 요약기·SRT/TXT·검색·바꾸기·DB CRUD·백업 직렬화·Drive 파일명 생성·웹훅 페이로드 직렬화·녹음 복구 스냅샷을 실제 실행해 `{name, pass, detail}[]` 반환.
 - `__vnDebug.seedDemo()`, `__vnDebug.createNoteFromBlob(blob, name)`, `__vnDebug.getState()` 제공.

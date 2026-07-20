@@ -53,8 +53,12 @@ VN.exporter = (function () {
   function toDOC(note, opts) {
     opts = Object.assign({ speaker: true, time: true, memos: true }, opts || {});
     const esc = U().esc;
+    const usedSpeakers = [...new Set((note.segments || []).map(s => s.speaker || 0))].sort((a, b) => a - b);
     let body = '<h1>' + esc(note.title) + '</h1>' +
       '<p style="color:#888">생성일: ' + esc(U().fmtDate(note.createdAt)) + ' / 길이: ' + esc(U().fmtTime(note.duration)) + '</p>';
+    if (usedSpeakers.length) {
+      body += '<p style="color:#888">참석자: ' + esc(usedSpeakers.map(i => speakerName(note, i)).join(', ')) + '</p>';
+    }
     for (const s of (note.segments || [])) {
       let head = '';
       if (opts.time) head += '<span style="color:#03C75A">[' + U().fmtTime(s.start) + ']</span> ';
@@ -67,6 +71,10 @@ VN.exporter = (function () {
     }
     if (note.summary && note.summary.summary) {
       body += '<h2>AI 요약</h2><p>' + esc(note.summary.summary).replace(/\n/g, '<br>') + '</p>';
+      if ((note.summary.topics || []).length) {
+        body += '<h3>주요 주제</h3><ul>' + note.summary.topics.map(t =>
+          '<li>[' + U().fmtTime(t.start || 0) + '] <b>' + esc(t.title) + '</b>' + (t.summary ? ' — ' + esc(t.summary) : '') + '</li>').join('') + '</ul>';
+      }
       if ((note.summary.todos || []).length) {
         body += '<h3>다음 할 일</h3><ul>' + note.summary.todos.map(t => '<li>' + esc(t) + '</li>').join('') + '</ul>';
       }

@@ -209,6 +209,46 @@ window.__vnDebug = {
       t('db.backup', bk.app === 'voicenote' && Array.isArray(bk.notes) && json.length > 50, 'bytes=' + json.length);
     } catch (e) { t('db.backup', false, String(e)); }
 
+    // 7) Drive 파일명 생성기 (금지문자 치환 + 주제 폴백)
+    try {
+      const dn = { createdAt: new Date(2026, 6, 20, 14, 5).getTime() };
+      const fn = VN.drive.makeFilename(dn, '예산/회의:*안건이매우길어서잘림?', 'doc');
+      const noBad = !/[\\/:*?"<>|]/.test(fn);
+      const topicPart = fn.slice('2026-07-20_1405_'.length).replace(/\.doc$/, '');
+      const fallback = VN.drive.localTopic(fake); // 키워드 상위 2개 폴백
+      t('drive.makeFilename', fn.startsWith('2026-07-20_1405_') && fn.endsWith('.doc') && noBad &&
+        topicPart.length > 0 && topicPart.length <= 15 && fallback.length > 0,
+        fn + ' / fallback=' + fallback);
+    } catch (e) { t('drive.makeFilename', false, String(e)); }
+
+    // 8) 웹훅 페이로드 직렬화/역직렬화
+    try {
+      const p = VN.drive.buildWebhookPayload('tok123', '2026-07-20_1405_회의.doc', 'application/msword', 'QUJDRA==');
+      const parsed = JSON.parse(p);
+      t('drive.webhookPayload',
+        parsed.token === 'tok123' && parsed.filename === '2026-07-20_1405_회의.doc' &&
+        parsed.mimeType === 'application/msword' && atob(parsed.dataBase64) === 'ABCD', '');
+    } catch (e) { t('drive.webhookPayload', false, String(e)); }
+
+    // 9) 녹음 복구 스냅샷 저장 → 복원 (recChunks store)
+    try {
+      await VN.db.put('recChunks', { id: '__t-meta', elapsed: 12, segments: [{ text: '복구테스트' }], mimeType: 'audio/webm' });
+      await VN.db.put('recChunks', { id: '__t-c1', idx: 1, blob: new Blob(['ab']) });
+      await VN.db.put('recChunks', { id: '__t-c2', idx: 2, blob: new Blob(['cd']) });
+      const meta = await VN.db.get('recChunks', '__t-meta');
+      const chunkRecs = (await VN.db.getAll('recChunks')).filter(r => String(r.id).startsWith('__t-c'));
+      const blob = VN.recorder.assembleChunks(chunkRecs);
+      const text = await blob.text();
+      await VN.db.del('recChunks', '__t-meta');
+      await VN.db.del('recChunks', '__t-c1');
+      await VN.db.del('recChunks', '__t-c2');
+      t('recovery.snapshot', meta && meta.elapsed === 12 && meta.segments[0].text === '복구테스트' &&
+        blob.size === 4 && text === 'abcd', 'assembled=' + text);
+    } catch (e) {
+      try { await VN.db.del('recChunks', '__t-meta'); await VN.db.del('recChunks', '__t-c1'); await VN.db.del('recChunks', '__t-c2'); } catch (e2) { /* ignore */ }
+      t('recovery.snapshot', false, String(e));
+    }
+
     console.table(results);
     return results;
   }

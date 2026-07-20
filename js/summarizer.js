@@ -207,6 +207,60 @@ VN.summarizer = (function () {
     };
   }
 
+  /* ── Gemini 오디오 전사: Blob(≤18MB)을 inlineData로 보내 화자 라벨 세그먼트 획득 ── */
+  async function transcribeAudioGemini(blob, opts) {
+    opts = opts || {};
+    const apiKey = await VN.db.getSetting('geminiApiKey', '');
+    if (!apiKey) throw new Error('Gemini API 키가 설정되지 않았습니다. (설정 → 고급 모드)');
+    if (!(blob instanceof Blob)) throw new Error('오디오가 없습니다.');
+    if (blob.size * 4 / 3 > 18 * 1024 * 1024) {
+      throw new Error('오디오가 18MB를 초과하여 Gemini 변환을 사용할 수 없습니다. (분할 미지원 — Whisper 변환을 사용하세요)');
+    }
+    const b64 = await VN.util.blobToBase64(blob);
+    const langLabel = { 'ko-KR': '한국어', 'en-US': '영어', 'ja-JP': '일본어', 'zh-CN': '중국어' }[opts.language] || '들리는 언어';
+    const prompt = '첨부된 오디오 전체를 ' + langLabel + '로 전사하세요. ' +
+      '각 발화를 {"start": 발화 시작 시각(초, number), "speaker": "참석자1"|"참석자2"|… (목소리로 화자 추정), "text": "발화 내용"} ' +
+      '객체로 하는 JSON 배열만 출력하세요. 다른 텍스트 금지. 무음 구간은 건너뛰세요.';
+    const resp = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+      body: JSON.stringify({
+        contents: [{
+          role: 'user',
+          parts: [
+            { text: prompt },
+            { inlineData: { mimeType: blob.type || 'audio/webm', data: b64 } }
+          ]
+        }],
+        generationConfig: {
+          responseMimeType: 'application/json',
+          temperature: 0.2,
+          thinkingConfig: { thinkingBudget: 0 }
+        }
+      })
+    });
+    if (!resp.ok) {
+      let msg = 'Gemini API 오류 (' + resp.status + ')';
+      try { const j = await resp.json(); if (j.error && j.error.message) msg += ': ' + j.error.message; } catch (e) { /* ignore */ }
+      throw new Error(msg);
+    }
+    const data = await resp.json();
+    let text = (data.candidates && data.candidates[0] && data.candidates[0].content &&
+      data.candidates[0].content.parts && data.candidates[0].content.parts[0] &&
+      data.candidates[0].content.parts[0].text) || '';
+    text = text.trim().replace(/^```(json)?/i, '').replace(/```$/, '').trim();
+    const jsonStart = text.indexOf('[');
+    if (jsonStart > 0) text = text.slice(jsonStart);
+    let arr;
+    try { arr = JSON.parse(text); } catch (e) { throw new Error('Gemini 전사 응답을 해석하지 못했습니다.'); }
+    if (!Array.isArray(arr)) throw new Error('Gemini 전사 응답 형식이 올바르지 않습니다.');
+    return arr.map(x => ({
+      start: Math.max(0, Number(x.start) || 0),
+      speakerLabel: String(x.speaker || '참석자1').trim() || '참석자1',
+      text: String(x.text || '').trim()
+    })).filter(x => x.text);
+  }
+
   /* ── 진입점: API 키가 있으면 Gemini, 실패 시 로컬 폴백 ── */
   async function run(note) {
     const apiKey = await VN.db.getSetting('geminiApiKey', '');
@@ -222,5 +276,5 @@ VN.summarizer = (function () {
     return runLocal(note);
   }
 
-  return { run, runLocal, runGemini, summarize, splitTopics, extractTodos, keywords, tokenize };
+  return { run, runLocal, runGemini, transcribeAudioGemini, summarize, splitTopics, extractTodos, keywords, tokenize };
 })();

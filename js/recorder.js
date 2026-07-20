@@ -1,9 +1,13 @@
-/* VN.recorder — MediaRecorder 녹음 + AnalyserNode 실시간 파형
-   일시정지 구간을 제외한 경과 시간(currentTime)을 제공한다. */
+/* VN.recorder — MediaRecorder 녹음 + AnalyserNode 실시간 파형 + 크래시 세이프
+   경과 시간은 Date.now() 절대시각 차(일시정지 구간 차감)로 계산한다 — 탭 숨김 중에도 정확.
+   setInterval/rAF는 UI 갱신 전용이며 데이터에 관여하지 않는다.
+   크래시 세이프: 1초 timeslice 청크를 5초마다 메타(세그먼트·메모·북마크·경과시간)와 함께
+   IndexedDB recChunks store에 flush → 앱 시작 시 잔존 세션 복구 가능. */
 window.VN = window.VN || {};
 
 VN.recorder = (function () {
   const supported = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder);
+  const FLUSH_MS = 5000;
 
   let state = 'idle'; // idle | recording | paused
   let mediaRecorder = null;
@@ -11,21 +15,28 @@ VN.recorder = (function () {
   let chunks = [];
   let mimeType = '';
 
-  // 경과 시간(일시정지 제외)
+  // 경과 시간(일시정지 제외) — Date.now() 기반 절대시각 차
   let accumMs = 0;        // 일시정지 이전까지 누적
-  let runStartMs = 0;     // 현재 구간 시작 시각(performance.now)
+  let runStartMs = 0;     // 현재 구간 시작 시각(Date.now)
 
   // 파형
   let audioCtx = null;
   let analyser = null;
   let waveCanvas = null;
   let rafId = null;
-  let levelSamples = [];  // 노트 저장용 파형 피크 (약 4Hz 샘플)
-  let lastLevelAt = 0;
+  let levelSamples = [];  // 노트 저장용 파형 피크
+  let levelTimer = null;  // 레벨 샘플링은 rAF가 아니라 interval (탭 숨김 시 rAF 정지 대비)
+
+  // 크래시 세이프 flush
+  let persist = null;       // { getMeta() } — ui가 세그먼트·메모·북마크 스냅샷 제공
+  let pendingChunks = [];   // 아직 IndexedDB에 저장 안 된 청크
+  let chunkSeq = 0;
+  let flushTimer = null;
+  let flushing = false;
 
   function currentTime() {
     let ms = accumMs;
-    if (state === 'recording') ms += performance.now() - runStartMs;
+    if (state === 'recording') ms += Date.now() - runStartMs;
     return ms / 1000;
   }
 
@@ -38,19 +49,21 @@ VN.recorder = (function () {
     return '';
   }
 
+  /* 레벨(RMS) 샘플링 — 데이터용이므로 rAF가 아닌 interval로 수행 */
+  function sampleLevel() {
+    if (!analyser || state !== 'recording') return;
+    const buf = new Uint8Array(analyser.fftSize);
+    analyser.getByteTimeDomainData(buf);
+    let sum = 0;
+    for (let i = 0; i < buf.length; i++) { const v = (buf[i] - 128) / 128; sum += v * v; }
+    levelSamples.push(Math.min(1, Math.sqrt(sum / buf.length) * 3));
+  }
+
+  /* 파형 그리기 — UI 전용. 탭 숨김 시 rAF가 자동 정지되고 복귀 시 재개된다. */
   function drawLoop() {
     if (!analyser) return;
     const buf = new Uint8Array(analyser.fftSize);
     analyser.getByteTimeDomainData(buf);
-    // 레벨(RMS) 계산
-    let sum = 0;
-    for (let i = 0; i < buf.length; i++) { const v = (buf[i] - 128) / 128; sum += v * v; }
-    const rms = Math.sqrt(sum / buf.length);
-    const now = performance.now();
-    if (state === 'recording' && now - lastLevelAt > 250) {
-      levelSamples.push(Math.min(1, rms * 3));
-      lastLevelAt = now;
-    }
     if (waveCanvas) {
       const ctx = waveCanvas.getContext('2d');
       const W = waveCanvas.width, H = waveCanvas.height;
@@ -70,6 +83,36 @@ VN.recorder = (function () {
     rafId = requestAnimationFrame(drawLoop);
   }
 
+  /* 5초 주기: 새 청크 + 메타 스냅샷을 recChunks store에 저장 */
+  async function flush() {
+    if (flushing || !persist) return;
+    flushing = true;
+    const toSave = pendingChunks.splice(0, pendingChunks.length);
+    try {
+      for (const c of toSave) {
+        await VN.db.put('recChunks', { id: 'c' + String(c.idx).padStart(6, '0'), idx: c.idx, blob: c.blob });
+      }
+      const meta = (persist.getMeta && persist.getMeta()) || {};
+      await VN.db.put('recChunks', Object.assign({}, meta, {
+        id: 'meta',
+        elapsed: currentTime(),
+        mimeType: mimeType || 'audio/webm',
+        updatedAt: Date.now()
+      }));
+    } catch (e) {
+      // 저장 실패 → 다음 주기에 재시도
+      pendingChunks = toSave.concat(pendingChunks);
+    }
+    flushing = false;
+  }
+
+  /* 복구용: recChunks 레코드 배열 → 하나의 Blob (webm 단순 연결) */
+  function assembleChunks(records) {
+    const sorted = (records || []).filter(r => r && r.blob).slice().sort((a, b) => (a.idx || 0) - (b.idx || 0));
+    const type = (sorted[0] && sorted[0].blob.type) || 'audio/webm';
+    return new Blob(sorted.map(r => r.blob), { type });
+  }
+
   async function start(opts) {
     opts = opts || {};
     if (!supported) throw new Error('이 브라우저는 녹음(MediaRecorder)을 지원하지 않습니다.');
@@ -80,24 +123,38 @@ VN.recorder = (function () {
     chunks = [];
     levelSamples = [];
     accumMs = 0;
-    mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
-    mediaRecorder.start(1000); // 1초 단위 청크
+    persist = opts.persist || null;
+    pendingChunks = [];
+    chunkSeq = 0;
+    mediaRecorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) {
+        chunks.push(e.data);
+        if (persist) pendingChunks.push({ idx: chunkSeq++, blob: e.data });
+      }
+    };
+    mediaRecorder.start(1000); // 1초 timeslice 청크
+
+    if (persist) {
+      try { await VN.db.clear('recChunks'); } catch (e) { /* ignore */ }
+      flushTimer = setInterval(flush, FLUSH_MS);
+    }
 
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     const src = audioCtx.createMediaStreamSource(stream);
     analyser = audioCtx.createAnalyser();
     analyser.fftSize = 2048;
     src.connect(analyser);
+    levelTimer = setInterval(sampleLevel, 250);
 
     waveCanvas = opts.canvas || null;
-    runStartMs = performance.now();
+    runStartMs = Date.now();
     state = 'recording';
     drawLoop();
   }
 
   function pause() {
     if (state !== 'recording') return;
-    accumMs += performance.now() - runStartMs;
+    accumMs += Date.now() - runStartMs;
     try { mediaRecorder.pause(); } catch (e) { /* ignore */ }
     state = 'paused';
   }
@@ -105,13 +162,19 @@ VN.recorder = (function () {
   function resume() {
     if (state !== 'paused') return;
     try { mediaRecorder.resume(); } catch (e) { /* ignore */ }
-    runStartMs = performance.now();
+    runStartMs = Date.now();
     state = 'recording';
   }
 
   function teardown() {
     if (rafId) cancelAnimationFrame(rafId);
     rafId = null;
+    if (levelTimer) clearInterval(levelTimer);
+    levelTimer = null;
+    if (flushTimer) clearInterval(flushTimer);
+    flushTimer = null;
+    persist = null;
+    pendingChunks = [];
     if (audioCtx) { try { audioCtx.close(); } catch (e) { /* ignore */ } }
     audioCtx = null; analyser = null; waveCanvas = null;
     if (stream) { stream.getTracks().forEach(t => t.stop()); }
@@ -119,11 +182,12 @@ VN.recorder = (function () {
     state = 'idle';
   }
 
-  /* 중지 → {blob, duration(초, 일시정지 제외), mimeType, waveform} */
+  /* 중지 → {blob, duration(초, 일시정지 제외), mimeType, waveform}
+     recChunks 정리는 노트 저장 성공 후 호출자가 VN.db.clear('recChunks')로 수행한다. */
   function stop() {
     return new Promise((res, rej) => {
       if (state === 'idle' || !mediaRecorder) return rej(new Error('녹음 중이 아닙니다.'));
-      if (state === 'recording') accumMs += performance.now() - runStartMs;
+      if (state === 'recording') accumMs += Date.now() - runStartMs;
       const duration = accumMs / 1000;
       const wf = levelSamples.slice();
       mediaRecorder.onstop = () => {
@@ -140,11 +204,12 @@ VN.recorder = (function () {
     try { if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop(); } catch (e) { /* ignore */ }
     chunks = [];
     teardown();
+    VN.db.clear('recChunks').catch(() => { /* ignore */ });
   }
 
   return {
     supported,
     get state() { return state; },
-    currentTime, start, pause, resume, stop, cancel
+    currentTime, start, pause, resume, stop, cancel, assembleChunks
   };
 })();
