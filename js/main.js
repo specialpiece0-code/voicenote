@@ -323,6 +323,25 @@ window.__vnDebug = {
         'expiresIn=3600 → +' + ((exp - t0) / 1000) + 's');
     } catch (e) { t('gauth.tokenExpiry', false, String(e)); }
 
+    // 15) 요약 품질 모드 → generationConfig (fetch를 가로채 실제 요청 본문 확인)
+    try {
+      const origFetch = window.fetch;
+      const bodies = [];
+      window.fetch = async (url, opts) => {
+        bodies.push(JSON.parse(opts.body));
+        return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"summary":"s"}' }] } }] }) };
+      };
+      try {
+        await VN.summarizer.runGemini(fake, 'test-key', VN.summarizer.DEFAULT_MODEL, 'quality');
+        await VN.summarizer.runGemini(fake, 'test-key', VN.summarizer.DEFAULT_MODEL, 'speed');
+      } finally { window.fetch = origFetch; }
+      const q = bodies[0] && bodies[0].generationConfig;
+      const s = bodies[1] && bodies[1].generationConfig;
+      t('summarizer.qualityMode',
+        bodies.length === 2 && q && s && !q.thinkingConfig && s.thinkingConfig && s.thinkingConfig.thinkingBudget === 0,
+        'quality=' + JSON.stringify((q || {}).thinkingConfig || null) + ' speed=' + JSON.stringify((s || {}).thinkingConfig || null));
+    } catch (e) { t('summarizer.qualityMode', false, String(e)); }
+
     console.table(results);
     return results;
   }

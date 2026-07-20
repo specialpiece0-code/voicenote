@@ -218,16 +218,28 @@ VN.summarizer = (function () {
     return SUMMARY_MODELS.indexOf(model) !== -1 ? model : DEFAULT_MODEL;
   }
 
-  /* pro 계열은 thinking을 끌 수 없어 thinkingBudget:0을 보내면 요청이 거부된다.
-     flash 계열에서만 thinkingConfig를 포함한다. */
-  function buildGenerationConfig(model, temperature) {
+  /* 요약 품질 모드 — 'quality'(사고 켬, 기본) / 'speed'(사고 끔) */
+  const QUALITY_MODES = ['quality', 'speed'];
+  const DEFAULT_QUALITY = 'quality';
+
+  function pickQuality(q) {
+    return QUALITY_MODES.indexOf(q) !== -1 ? q : DEFAULT_QUALITY;
+  }
+
+  /* quality='quality'  → thinkingConfig를 생략한다. 모델 기본값이 동적 사고이며,
+                          실호출에서 usageMetadata.thoughtsTokenCount > 0으로 확인됨.
+     quality='speed'    → thinkingBudget:0으로 사고를 꺼 응답을 빠르게 한다.
+     pro 계열은 thinking을 끌 수 없어 thinkingBudget:0을 보내면 요청이 거부되므로 제외.
+     quality 미지정(오디오 전사 등)은 기존대로 속도 우선. */
+  function buildGenerationConfig(model, temperature, quality) {
     const cfg = { responseMimeType: 'application/json', temperature: temperature };
-    if (String(model).indexOf('pro') === -1) cfg.thinkingConfig = { thinkingBudget: 0 };
+    if (quality !== 'quality' && String(model).indexOf('pro') === -1) cfg.thinkingConfig = { thinkingBudget: 0 };
     return cfg;
   }
 
-  async function runGemini(note, apiKey, model) {
+  async function runGemini(note, apiKey, model, quality) {
     model = pickModel(model);
+    quality = pickQuality(quality);
     const segs = (note.segments || []).filter(s => s.text && s.text.trim());
     if (!segs.length) throw new Error('요약할 텍스트가 없습니다.');
     const speakers = note.speakers || [];
@@ -260,7 +272,7 @@ VN.summarizer = (function () {
       },
       body: JSON.stringify({
         contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        generationConfig: buildGenerationConfig(model, 0.3)
+        generationConfig: buildGenerationConfig(model, 0.3, quality)
       })
     });
     if (!resp.ok) {
@@ -306,7 +318,7 @@ VN.summarizer = (function () {
             { inlineData: { mimeType: blob.type || 'audio/webm', data: b64 } }
           ]
         }],
-        generationConfig: buildGenerationConfig(TRANSCRIBE_MODEL, 0.2)
+        generationConfig: buildGenerationConfig(TRANSCRIBE_MODEL, 0.2, 'speed')
       })
     });
     if (!resp.ok) {
@@ -337,7 +349,8 @@ VN.summarizer = (function () {
     if (apiKey) {
       try {
         const model = pickModel(await VN.db.getSetting('geminiModel', DEFAULT_MODEL));
-        return await runGemini(note, apiKey, model);
+        const quality = pickQuality(await VN.db.getSetting('geminiQuality', DEFAULT_QUALITY));
+        return await runGemini(note, apiKey, model, quality);
       } catch (e) {
         const local = runLocal(note);
         local.fallbackReason = 'Gemini API 실패로 기본 모드로 생성했습니다: ' + (e.message || e);
@@ -351,6 +364,7 @@ VN.summarizer = (function () {
     run, runLocal, runGemini, transcribeAudioGemini,
     summarize, splitTopics, extractTodos, keywords, tokenize,
     normalizeSummary, normalizeTodos, groupTodosByOwner,
-    SUMMARY_MODELS, DEFAULT_MODEL, TRANSCRIBE_MODEL
+    SUMMARY_MODELS, DEFAULT_MODEL, TRANSCRIBE_MODEL,
+    QUALITY_MODES, DEFAULT_QUALITY, pickQuality
   };
 })();

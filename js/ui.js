@@ -1745,7 +1745,7 @@ VN.ui = (function () {
 
   async function viewSettings() {
     const [lang, theme, apiKey, driveAuto, driveFormat, driveAudio, hookUrl, hookToken, driveLast, folderStatus,
-      clientId, gStatus, apiStatus, driveTarget, dgKey, aaiKey, geminiModel] = await Promise.all([
+      clientId, gStatus, apiStatus, driveTarget, dgKey, aaiKey, geminiModel, geminiQuality] = await Promise.all([
       VN.db.getSetting('defaultLang', 'ko-KR'),
       VN.db.getSetting('theme', 'system'),
       VN.db.getSetting('geminiApiKey', ''),
@@ -1762,7 +1762,8 @@ VN.ui = (function () {
       VN.drive.getTarget(),
       VN.db.getSetting('deepgramApiKey', ''),
       VN.db.getSetting('assemblyaiApiKey', ''),
-      VN.db.getSetting('geminiModel', VN.summarizer.DEFAULT_MODEL)
+      VN.db.getSetting('geminiModel', VN.summarizer.DEFAULT_MODEL),
+      VN.db.getSetting('geminiQuality', VN.summarizer.DEFAULT_QUALITY)
     ]);
     // 사용 통계
     const now = new Date();
@@ -1794,10 +1795,15 @@ VN.ui = (function () {
       '<button class="btn btn-sm btn-primary" id="st-apikey-save">저장</button>' +
       (apiKey ? '<button class="btn btn-sm" id="st-apikey-del">삭제</button>' : '') + '</div>' +
       '<div class="settings-row"><label>요약 모델</label><select id="st-gemini-model">' +
-      '<option value="gemini-3.5-flash">gemini-3.5-flash — 권장, 무료</option>' +
+      '<option value="gemini-3.5-flash">gemini-3.5-flash — 최상위 모델, 무료</option>' +
       '<option value="gemini-flash-latest">gemini-flash-latest — 대안, 무료 (최신 flash 자동 추종)</option></select></div>' +
-      '<p class="muted small">모델 선택은 요약에만 적용됩니다. 오디오 전사(Gemini 변환)는 비용이 커서 항상 gemini-3.5-flash를 사용합니다. ' +
-      '더 높은 품질을 원하면 Google AI Studio에서 결제를 활성화하면 pro 모델을 쓸 수 있습니다.</p></div>';
+      '<p class="muted small">gemini-3.5-flash는 현재 Gemini 계열에서 가장 지능적인 최상위 모델입니다(3.5 세대에 pro 변형은 없습니다). ' +
+      '모델 선택은 요약에만 적용되며, 오디오 전사(Gemini 변환)는 비용이 커서 항상 gemini-3.5-flash를 사용합니다.</p>' +
+      '<div class="settings-row"><label>요약 품질</label><select id="st-gemini-quality">' +
+      '<option value="quality">정확도 우선 (권장, 느림)</option>' +
+      '<option value="speed">속도 우선</option></select></div>' +
+      '<p class="muted small">정확도 우선은 모델이 내용을 더 깊이 검토해 결정 사항과 담당자를 정확히 뽑아내지만, 요약 생성에 시간이 더 걸립니다. ' +
+      '품질 설정은 요약에만 적용됩니다(오디오 전사는 항상 속도 우선).</p></div>';
 
     /* ── 자동 화자분리 API 키 ── */
     const keyRow = (id, label, val, ph) =>
@@ -1932,6 +1938,11 @@ VN.ui = (function () {
     $('#st-gemini-model').onchange = async (e) => {
       await VN.db.setSetting('geminiModel', e.target.value);
       toast('요약 모델을 변경했습니다.');
+    };
+    $('#st-gemini-quality').value = VN.summarizer.pickQuality(geminiQuality);
+    $('#st-gemini-quality').onchange = async (e) => {
+      await VN.db.setSetting('geminiQuality', e.target.value);
+      toast(e.target.value === 'quality' ? '정확도 우선으로 변경했습니다.' : '속도 우선으로 변경했습니다.');
     };
     $('#st-apikey-save').onclick = async () => {
       const v = $('#st-apikey').value.trim();
