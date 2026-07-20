@@ -857,29 +857,54 @@ VN.ui = (function () {
       '<button class="btn btn-primary" id="btn-ai-run">' + (s ? 'AI 정리 다시 생성' : 'AI 정리 생성') + '</button>' +
       '<span class="muted small" id="ai-mode-info"></span></div><div id="ai-result"></div>';
     body.innerHTML = html;
-    VN.db.getSetting('geminiApiKey', '').then(k => {
-      $('#ai-mode-info') && ($('#ai-mode-info').textContent = k ? '고급 모드(Gemini 2.5 Flash) (실패 시 기본 모드 폴백)' : '기본 모드 (오프라인 추출 요약)');
+    Promise.all([
+      VN.db.getSetting('geminiApiKey', ''),
+      VN.db.getSetting('geminiModel', VN.summarizer.DEFAULT_MODEL)
+    ]).then(([k, m]) => {
+      const label = VN.summarizer.SUMMARY_MODELS.indexOf(m) !== -1 ? m : VN.summarizer.DEFAULT_MODEL;
+      $('#ai-mode-info') && ($('#ai-mode-info').textContent = k ? '고급 모드(' + label + ') (실패 시 기본 모드 폴백)' : '기본 모드 (오프라인 추출 요약)');
     });
 
     const renderResult = () => {
       const el = $('#ai-result');
-      const sum = note.summary;
-      if (!sum) { el.innerHTML = '<div class="empty-state">버튼을 눌러 요약·주요 주제·다음 할 일·키워드를 생성하세요.<br><span class="small">모든 결과는 클릭해서 편집할 수 있습니다.</span></div>'; return; }
+      if (!note.summary) { el.innerHTML = '<div class="empty-state">버튼을 눌러 요약·결정 사항·미결 안건·담당자별 할 일·주제·키워드를 생성하세요.<br><span class="small">모든 결과는 클릭해서 편집할 수 있습니다.</span></div>'; return; }
+      // 구형 저장분(문자열 todos·decisions 없음)도 같은 형태로 다루도록 메모리상에서만 정규화
+      const sum = VN.summarizer.normalizeSummary(note.summary);
+      note.summary = sum;
       let h = '';
       if (sum.fallbackReason) h += '<div class="banner">' + U.esc(sum.fallbackReason) + '</div>';
       h += '<div class="ai-block"><h3><span class="dot"></span>요약 <span class="faint small">(' + (sum.mode === 'gemini' ? 'Gemini' : '기본') + ')</span></h3>' +
         '<div class="ai-editable" id="ai-summary" contenteditable="true">' + U.esc(sum.summary || '') + '</div></div>';
-      h += '<div class="ai-block"><h3><span class="dot"></span>주요 주제</h3>' +
-        ((sum.topics || []).length ? sum.topics.map((t, i) =>
-          '<div style="margin-bottom:8px"><span class="seg-time memo-time" data-topic-t="' + (t.start || 0) + '">' + U.fmtTime(t.start || 0) + '</span> ' +
-          '<b class="ai-editable" contenteditable="true" data-topic-title="' + i + '" style="display:inline-block">' + U.esc(t.title) + '</b>' +
-          '<div class="ai-editable muted" contenteditable="true" data-topic-sum="' + i + '">' + U.esc(t.summary) + '</div></div>'
-        ).join('') : '<div class="faint">추출된 주제가 없습니다.</div>') + '</div>';
-      h += '<div class="ai-block"><h3><span class="dot"></span>다음 할 일</h3><ul id="ai-todos">' +
-        ((sum.todos || []).length ? sum.todos.map((t, i) =>
-          '<li><span class="ai-editable" contenteditable="true" data-todo="' + i + '">' + U.esc(t) + '</span> ' +
-          '<button class="icon-btn btn-sm" data-todo-del="' + i + '" style="padding:1px 6px">✕</button></li>').join('') : '') +
-        '</ul><button class="btn btn-sm btn-outline" id="ai-todo-add">＋ 항목 추가</button></div>';
+      /* 결정 사항 / 미결 안건 — 담당자별 할 일·키워드와 동일하게 추가 버튼은 항상 노출 */
+      const simpleList = (title, key, items) =>
+        '<div class="ai-block"><h3><span class="dot"></span>' + title + '</h3><ul>' + items.map((x, i) =>
+          '<li><span class="ai-editable" contenteditable="true" data-list="' + key + '" data-idx="' + i + '">' + U.esc(x) + '</span> ' +
+          '<button class="icon-btn btn-sm" data-list-del="' + key + '" data-idx="' + i + '" style="padding:1px 6px">✕</button></li>'
+        ).join('') + '</ul><button class="btn btn-sm btn-outline" data-list-add="' + key + '">＋ 항목 추가</button></div>';
+      h += simpleList('결정 사항', 'decisions', sum.decisions);
+      h += simpleList('미결 안건', 'openIssues', sum.openIssues);
+      /* 담당자별 할 일 — 담당자 이름으로 그룹(담당자 없으면 '미지정') */
+      h += '<div class="ai-block"><h3><span class="dot"></span>담당자별 할 일</h3>';
+      const groups = VN.summarizer.groupTodosByOwner(sum.todos);
+      if (groups.length) {
+        h += groups.map(g =>
+          '<div style="margin-bottom:8px"><div class="faint small" style="font-weight:600">' + U.esc(g.owner) + '</div><ul>' +
+          g.items.map(t => {
+            const i = t.index;
+            return '<li><span class="ai-editable" contenteditable="true" data-todo="' + i + '">' + U.esc(t.task) + '</span> ' +
+              '<span class="ai-editable faint small" contenteditable="true" data-todo-due="' + i + '">' + U.esc(t.due || '기한 없음') + '</span> ' +
+              '<button class="icon-btn btn-sm" data-todo-del="' + i + '" style="padding:1px 6px">✕</button></li>';
+          }).join('') + '</ul></div>').join('');
+      }
+      h += '<button class="btn btn-sm btn-outline" id="ai-todo-add">＋ 항목 추가</button></div>';
+      if (sum.topics.length) {
+        h += '<div class="ai-block"><h3><span class="dot"></span>주요 주제</h3>' +
+          sum.topics.map((t, i) =>
+            '<div style="margin-bottom:8px"><span class="seg-time memo-time" data-topic-t="' + (t.start || 0) + '">' + U.fmtTime(t.start || 0) + '</span> ' +
+            '<b class="ai-editable" contenteditable="true" data-topic-title="' + i + '" style="display:inline-block">' + U.esc(t.title) + '</b>' +
+            '<div class="ai-editable muted" contenteditable="true" data-topic-sum="' + i + '">' + U.esc(t.summary) + '</div></div>'
+          ).join('') + '</div>';
+      }
       h += '<div class="ai-block"><h3><span class="dot"></span>키워드</h3><div id="ai-kws">' +
         (sum.keywords || []).map((k, i) => '<span class="kw-chip">#' + U.esc(k) + ' <a href="#" data-kw-del="' + i + '" style="text-decoration:none">✕</a></span>').join('') +
         '</div><div class="record-memo-row" style="margin-top:8px;max-width:260px"><input type="text" id="ai-kw-new" placeholder="키워드 추가">' +
@@ -891,9 +916,27 @@ VN.ui = (function () {
       $$('[data-topic-title]', el).forEach(x => x.onblur = async () => { note.summary.topics[+x.dataset.topicTitle].title = x.textContent.trim(); await saveNote(note); });
       $$('[data-topic-sum]', el).forEach(x => x.onblur = async () => { note.summary.topics[+x.dataset.topicSum].summary = x.textContent.trim(); await saveNote(note); });
       $$('[data-topic-t]', el).forEach(x => x.onclick = () => { if (S.player) S.player.playFrom(+x.dataset.topicT); });
-      $$('[data-todo]', el).forEach(x => x.onblur = async () => { note.summary.todos[+x.dataset.todo] = x.textContent.trim(); await saveNote(note); });
+      $$('[data-list]', el).forEach(x => x.onblur = async () => {
+        note.summary[x.dataset.list][+x.dataset.idx] = x.textContent.trim();
+        await saveNote(note);
+      });
+      $$('[data-list-del]', el).forEach(x => x.onclick = async () => {
+        note.summary[x.dataset.listDel].splice(+x.dataset.idx, 1);
+        await saveNote(note); renderResult();
+      });
+      $$('[data-list-add]', el).forEach(x => x.onclick = async () => {
+        const key = x.dataset.listAdd;
+        note.summary[key].push(key === 'decisions' ? '새 결정 사항' : '새 미결 안건');
+        await saveNote(note); renderResult();
+      });
+      $$('[data-todo]', el).forEach(x => x.onblur = async () => { note.summary.todos[+x.dataset.todo].task = x.textContent.trim(); await saveNote(note); });
+      $$('[data-todo-due]', el).forEach(x => x.onblur = async () => {
+        const v = x.textContent.trim();
+        note.summary.todos[+x.dataset.todoDue].due = (v === '기한 없음') ? '' : v;
+        await saveNote(note);
+      });
       $$('[data-todo-del]', el).forEach(x => x.onclick = async () => { note.summary.todos.splice(+x.dataset.todoDel, 1); await saveNote(note); renderResult(); });
-      $('#ai-todo-add').onclick = async () => { note.summary.todos.push('새 할 일'); await saveNote(note); renderResult(); };
+      $('#ai-todo-add').onclick = async () => { note.summary.todos.push({ owner: '', task: '새 할 일', due: '' }); await saveNote(note); renderResult(); };
       $$('[data-kw-del]', el).forEach(x => x.onclick = async (e) => { e.preventDefault(); note.summary.keywords.splice(+x.dataset.kwDel, 1); await saveNote(note); renderResult(); });
       $('#ai-kw-add').onclick = async () => {
         const v = $('#ai-kw-new').value.trim();
@@ -1702,7 +1745,7 @@ VN.ui = (function () {
 
   async function viewSettings() {
     const [lang, theme, apiKey, driveAuto, driveFormat, driveAudio, hookUrl, hookToken, driveLast, folderStatus,
-      clientId, gStatus, apiStatus, driveTarget, dgKey, aaiKey] = await Promise.all([
+      clientId, gStatus, apiStatus, driveTarget, dgKey, aaiKey, geminiModel] = await Promise.all([
       VN.db.getSetting('defaultLang', 'ko-KR'),
       VN.db.getSetting('theme', 'system'),
       VN.db.getSetting('geminiApiKey', ''),
@@ -1718,7 +1761,8 @@ VN.ui = (function () {
       VN.drive.getApiStatus(),
       VN.drive.getTarget(),
       VN.db.getSetting('deepgramApiKey', ''),
-      VN.db.getSetting('assemblyaiApiKey', '')
+      VN.db.getSetting('assemblyaiApiKey', ''),
+      VN.db.getSetting('geminiModel', VN.summarizer.DEFAULT_MODEL)
     ]);
     // 사용 통계
     const now = new Date();
@@ -1743,12 +1787,17 @@ VN.ui = (function () {
       '<div class="settings-row"><label>테마</label><select id="st-theme">' +
       '<option value="system">시스템 설정 따름</option><option value="light">라이트</option><option value="dark">다크</option></select></div></div>';
 
-    html += '<div class="settings-group"><h2>고급 모드(Gemini 2.5 Flash)</h2>' +
-      '<p class="muted small" style="margin-bottom:8px">API 키를 입력하면 요약·주제·할 일·키워드를 Gemini가 생성합니다. Google AI Studio(aistudio.google.com/apikey)에서 무료 발급, 브라우저에만 저장됨. 실패 시 기본 모드로 자동 폴백합니다.</p>' +
+    html += '<div class="settings-group"><h2>고급 모드(Gemini)</h2>' +
+      '<p class="muted small" style="margin-bottom:8px">API 키를 입력하면 요약·결정 사항·미결 안건·담당자별 할 일·주제·키워드를 Gemini가 생성합니다. Google AI Studio(aistudio.google.com/apikey)에서 무료 발급, 브라우저에만 저장됨. 실패 시 기본 모드로 자동 폴백합니다.</p>' +
       '<div class="settings-row"><label>Gemini API 키</label>' +
       '<input type="password" id="st-apikey" style="flex:1;min-width:160px" placeholder="' + (apiKey ? '저장됨 (••••' + apiKey.slice(-4) + ')' : 'AIza…') + '">' +
       '<button class="btn btn-sm btn-primary" id="st-apikey-save">저장</button>' +
-      (apiKey ? '<button class="btn btn-sm" id="st-apikey-del">삭제</button>' : '') + '</div></div>';
+      (apiKey ? '<button class="btn btn-sm" id="st-apikey-del">삭제</button>' : '') + '</div>' +
+      '<div class="settings-row"><label>요약 모델</label><select id="st-gemini-model">' +
+      '<option value="gemini-3.5-flash">gemini-3.5-flash — 권장, 무료</option>' +
+      '<option value="gemini-flash-latest">gemini-flash-latest — 대안, 무료 (최신 flash 자동 추종)</option></select></div>' +
+      '<p class="muted small">모델 선택은 요약에만 적용됩니다. 오디오 전사(Gemini 변환)는 비용이 커서 항상 gemini-3.5-flash를 사용합니다. ' +
+      '더 높은 품질을 원하면 Google AI Studio에서 결제를 활성화하면 pro 모델을 쓸 수 있습니다.</p></div>';
 
     /* ── 자동 화자분리 API 키 ── */
     const keyRow = (id, label, val, ph) =>
@@ -1878,6 +1927,11 @@ VN.ui = (function () {
     $('#st-theme').onchange = async (e) => {
       await VN.db.setSetting('theme', e.target.value);
       applyTheme(e.target.value);
+    };
+    $('#st-gemini-model').value = VN.summarizer.SUMMARY_MODELS.indexOf(geminiModel) !== -1 ? geminiModel : VN.summarizer.DEFAULT_MODEL;
+    $('#st-gemini-model').onchange = async (e) => {
+      await VN.db.setSetting('geminiModel', e.target.value);
+      toast('요약 모델을 변경했습니다.');
     };
     $('#st-apikey-save').onclick = async () => {
       const v = $('#st-apikey').value.trim();

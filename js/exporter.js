@@ -4,6 +4,11 @@ window.VN = window.VN || {};
 VN.exporter = (function () {
   const U = () => VN.util;
 
+  /* 구형(문자열 todos·decisions 없음)/신형 요약을 모두 같은 형태로 다룬다 */
+  function normSummary(sum) {
+    return VN.summarizer.normalizeSummary(sum);
+  }
+
   function speakerName(note, idx) {
     const sp = (note.speakers || [])[idx];
     return (sp && sp.name) || ('참석자 ' + ((idx || 0) + 1));
@@ -37,13 +42,27 @@ VN.exporter = (function () {
       for (const m of note.memos) lines.push('[' + U().fmtTime(m.time) + '] ' + m.text);
     }
     if (note.summary && note.summary.summary) {
+      const sum = normSummary(note.summary);
       lines.push('');
       lines.push('--- AI 요약 ---');
-      lines.push(note.summary.summary);
-      if ((note.summary.todos || []).length) {
+      lines.push(sum.summary);
+      if (sum.decisions.length) {
         lines.push('');
-        lines.push('다음 할 일:');
-        for (const t of note.summary.todos) lines.push('- ' + t);
+        lines.push('결정 사항:');
+        for (const d of sum.decisions) lines.push('- ' + d);
+      }
+      if (sum.openIssues.length) {
+        lines.push('');
+        lines.push('미결 안건:');
+        for (const o of sum.openIssues) lines.push('- ' + o);
+      }
+      if (sum.todos.length) {
+        lines.push('');
+        lines.push('담당자별 할 일:');
+        for (const g of VN.summarizer.groupTodosByOwner(sum.todos)) {
+          lines.push('[' + g.owner + ']');
+          for (const t of g.items) lines.push('- ' + t.task + (t.due ? ' (기한: ' + t.due + ')' : ''));
+        }
       }
     }
     return lines.join('\r\n');
@@ -70,13 +89,23 @@ VN.exporter = (function () {
       for (const m of note.memos) body += '<p>[' + U().fmtTime(m.time) + '] ' + esc(m.text) + '</p>';
     }
     if (note.summary && note.summary.summary) {
-      body += '<h2>AI 요약</h2><p>' + esc(note.summary.summary).replace(/\n/g, '<br>') + '</p>';
-      if ((note.summary.topics || []).length) {
-        body += '<h3>주요 주제</h3><ul>' + note.summary.topics.map(t =>
-          '<li>[' + U().fmtTime(t.start || 0) + '] <b>' + esc(t.title) + '</b>' + (t.summary ? ' — ' + esc(t.summary) : '') + '</li>').join('') + '</ul>';
+      const sum = normSummary(note.summary);
+      body += '<h2>AI 요약</h2><p>' + esc(sum.summary).replace(/\n/g, '<br>') + '</p>';
+      if (sum.decisions.length) {
+        body += '<h3>결정 사항</h3><ul>' + sum.decisions.map(d => '<li>' + esc(d) + '</li>').join('') + '</ul>';
       }
-      if ((note.summary.todos || []).length) {
-        body += '<h3>다음 할 일</h3><ul>' + note.summary.todos.map(t => '<li>' + esc(t) + '</li>').join('') + '</ul>';
+      if (sum.openIssues.length) {
+        body += '<h3>미결 안건</h3><ul>' + sum.openIssues.map(o => '<li>' + esc(o) + '</li>').join('') + '</ul>';
+      }
+      if (sum.todos.length) {
+        body += '<h3>담당자별 할 일</h3>' + VN.summarizer.groupTodosByOwner(sum.todos).map(g =>
+          '<p style="margin:6px 0 2px"><b>' + esc(g.owner) + '</b></p><ul>' + g.items.map(t =>
+            '<li>' + esc(t.task) + (t.due ? ' <span style="color:#888">(기한: ' + esc(t.due) + ')</span>' : '') + '</li>'
+          ).join('') + '</ul>').join('');
+      }
+      if (sum.topics.length) {
+        body += '<h3>주요 주제</h3><ul>' + sum.topics.map(t =>
+          '<li>[' + U().fmtTime(t.start || 0) + '] <b>' + esc(t.title) + '</b>' + (t.summary ? ' — ' + esc(t.summary) : '') + '</li>').join('') + '</ul>';
       }
     }
     return '<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word">' +
@@ -152,7 +181,7 @@ VN.exporter = (function () {
       speakers: note.speakers,
       segments: note.segments,
       memos: note.memos,
-      summary: note.summary
+      summary: note.summary ? normSummary(note.summary) : note.summary
     };
     if (opts.includeAudio && note.audioBlob instanceof Blob) {
       payload.audioDataURL = await U().blobToDataURL(note.audioBlob);
@@ -195,7 +224,11 @@ VN.exporter = (function () {
 '  var h="<h1>"+esc(d.title)+"</h1><div class=meta>"+new Date(d.createdAt).toLocaleString("ko-KR")+" · 길이 "+fmt(d.duration)+" · 보이스노트로 공유됨</div>";\n' +
 '  if(d.audioDataURL)h+="<audio controls src=\\""+d.audioDataURL+"\\"></audio>";\n' +
 '  if(d.summary&&d.summary.summary){h+="<div class=box><h2>AI 요약</h2><div>"+esc(d.summary.summary).replace(/\\n/g,"<br>")+"</div>";\n' +
-'    if(d.summary.todos&&d.summary.todos.length){h+="<h2 style=margin-top:12px>다음 할 일</h2><ul>";d.summary.todos.forEach(function(t){h+="<li>"+esc(t)+"</li>"});h+="</ul>"}\n' +
+'    if(d.summary.decisions&&d.summary.decisions.length){h+="<h2 style=margin-top:12px>결정 사항</h2><ul>";d.summary.decisions.forEach(function(x){h+="<li>"+esc(x)+"</li>"});h+="</ul>"}\n' +
+'    if(d.summary.openIssues&&d.summary.openIssues.length){h+="<h2 style=margin-top:12px>미결 안건</h2><ul>";d.summary.openIssues.forEach(function(x){h+="<li>"+esc(x)+"</li>"});h+="</ul>"}\n' +
+'    if(d.summary.todos&&d.summary.todos.length){h+="<h2 style=margin-top:12px>담당자별 할 일</h2><ul>";d.summary.todos.forEach(function(t){\n' +
+'      var task=(t&&typeof t==="object")?t.task:t, owner=(t&&typeof t==="object")?t.owner:"", due=(t&&typeof t==="object")?t.due:"";\n' +
+'      h+="<li>"+(owner?"<b>"+esc(owner)+"</b>: ":"")+esc(task)+(due?" <span style=color:#888>(기한: "+esc(due)+")</span>":"")+"</li>"});h+="</ul>"}\n' +
 '    if(d.summary.keywords&&d.summary.keywords.length){h+="<div style=margin-top:8px>";d.summary.keywords.forEach(function(k){h+="<span class=badge>#"+esc(k)+"</span>"});h+="</div>"}\n' +
 '    h+="</div>"}\n' +
 '  h+="<div class=box><h2>음성 기록</h2>";\n' +

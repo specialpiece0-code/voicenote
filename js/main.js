@@ -153,6 +153,25 @@ window.__vnDebug = {
         'keywords=' + sum.keywords.join(',') + ' todos=' + sum.todos.length);
     } catch (e) { t('summarizer.runLocal', false, String(e)); }
 
+    // 1-b) 요약 스키마 정규화 (구형 문자열 todos → {owner,task,due} 객체 + 담당자별 그룹)
+    try {
+      const old = { mode: 'gemini', summary: '예전 요약', todos: ['금요일까지 보고서 공유', '랜딩 시안 준비'], keywords: ['예산'] };
+      const n = VN.summarizer.normalizeSummary(old);
+      const nw = VN.summarizer.normalizeSummary({
+        summary: 's', decisions: ['런칭일 8/15 확정'], openIssues: ['채널 미정'],
+        todos: [{ owner: '김팀장', task: '예산 확정', due: '이번 주 금요일' }, { task: '시안 준비' }]
+      });
+      const groups = VN.summarizer.groupTodosByOwner(nw.todos);
+      t('summarizer.normalizeSummary',
+        n.todos.length === 2 && n.todos[0].task === '금요일까지 보고서 공유' && n.todos[0].owner === '' && n.todos[0].due === '' &&
+        Array.isArray(n.decisions) && n.decisions.length === 0 && Array.isArray(n.openIssues) && n.openIssues.length === 0 &&
+        nw.decisions[0] === '런칭일 8/15 확정' && nw.openIssues[0] === '채널 미정' &&
+        nw.todos[0].owner === '김팀장' && nw.todos[0].due === '이번 주 금요일' &&
+        groups.length === 2 && groups[0].owner === '김팀장' && groups[0].items[0].index === 0 &&
+        groups[1].owner === '미지정' && groups[1].items[0].index === 1,
+        'old.todos→' + JSON.stringify(n.todos[0]) + ' groups=' + groups.map(g => g.owner).join('/'));
+    } catch (e) { t('summarizer.normalizeSummary', false, String(e)); }
+
     // 2) SRT/TXT/VTT 생성
     try {
       const srt = VN.exporter.toSRT(fake);

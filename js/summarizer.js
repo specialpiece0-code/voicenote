@@ -137,6 +137,59 @@ VN.summarizer = (function () {
     return out;
   }
 
+  /* ── 스키마 정규화 (구형 저장분 하위 호환) ──
+     구형: todos = ["문자열", …], decisions/openIssues 없음
+     신형: todos = [{owner, task, due}, …] */
+  function normalizeTodos(todos) {
+    if (!Array.isArray(todos)) return [];
+    return todos.map(t => {
+      if (typeof t === 'string') return { owner: '', task: t.trim(), due: '' };
+      if (t && typeof t === 'object') {
+        return {
+          owner: String(t.owner == null ? '' : t.owner).trim(),
+          task: String(t.task == null ? '' : t.task).trim(),
+          due: String(t.due == null ? '' : t.due).trim()
+        };
+      }
+      return { owner: '', task: '', due: '' };
+    }).filter(t => t.task);
+  }
+
+  function strList(arr) {
+    return Array.isArray(arr) ? arr.map(x => String(x == null ? '' : x).trim()).filter(Boolean) : [];
+  }
+
+  function normalizeSummary(sum) {
+    if (!sum || typeof sum !== 'object') return sum;
+    return Object.assign({}, sum, {
+      summary: String(sum.summary || ''),
+      decisions: strList(sum.decisions),
+      openIssues: strList(sum.openIssues),
+      todos: normalizeTodos(sum.todos),
+      topics: Array.isArray(sum.topics) ? sum.topics.map(t => ({
+        title: String((t && t.title) || ''),
+        summary: String((t && t.summary) || ''),
+        start: Number(t && t.start) || 0
+      })) : [],
+      keywords: strList(sum.keywords)
+    });
+  }
+
+  /* 담당자별 그룹 (담당자 없으면 '미지정').
+     items[].index는 정규화된 todos 배열에서의 위치 — 편집 UI가 원본을 되짚는 데 쓴다. */
+  function groupTodosByOwner(todos) {
+    const groups = [];
+    const byOwner = new Map();
+    const list = normalizeTodos(todos);
+    list.forEach((t, i) => {
+      const key = t.owner || '미지정';
+      if (!byOwner.has(key)) { byOwner.set(key, []); groups.push({ owner: key, items: byOwner.get(key) }); }
+      byOwner.get(key).push(Object.assign({ index: i }, t));
+    });
+    // '미지정'은 항상 마지막
+    return groups.sort((a, b) => (a.owner === '미지정' ? 1 : 0) - (b.owner === '미지정' ? 1 : 0));
+  }
+
   /* ── 로컬 실행 ── */
   function runLocal(note) {
     const segs = (note.segments || []).filter(s => s.text && s.text.trim());
@@ -145,29 +198,61 @@ VN.summarizer = (function () {
     return {
       mode: 'local',
       summary: summarize(sentences, 5) || '(요약할 텍스트가 없습니다)',
+      decisions: [],
+      openIssues: [],
       topics: splitTopics(segs),
-      todos: extractTodos(sentences),
+      todos: extractTodos(sentences).map(task => ({ owner: '', task, due: '' })),
       keywords: keywords(fullText, 8)
     };
   }
 
   /* ── Gemini API 고급 모드 ── */
-  async function runGemini(note, apiKey) {
+  /* 무료 티어에서 실제로 응답하는 모델만 노출한다.
+     (2.5 계열은 신규 사용자에게 404, pro 계열은 무료 티어 쿼터 0으로 429) */
+  const SUMMARY_MODELS = ['gemini-3.5-flash', 'gemini-flash-latest'];
+  const DEFAULT_MODEL = 'gemini-3.5-flash';
+  /* 오디오 전사는 비용이 커서 요약 모델 선택과 무관하게 flash 고정 */
+  const TRANSCRIBE_MODEL = DEFAULT_MODEL;
+
+  function pickModel(model) {
+    return SUMMARY_MODELS.indexOf(model) !== -1 ? model : DEFAULT_MODEL;
+  }
+
+  /* pro 계열은 thinking을 끌 수 없어 thinkingBudget:0을 보내면 요청이 거부된다.
+     flash 계열에서만 thinkingConfig를 포함한다. */
+  function buildGenerationConfig(model, temperature) {
+    const cfg = { responseMimeType: 'application/json', temperature: temperature };
+    if (String(model).indexOf('pro') === -1) cfg.thinkingConfig = { thinkingBudget: 0 };
+    return cfg;
+  }
+
+  async function runGemini(note, apiKey, model) {
+    model = pickModel(model);
     const segs = (note.segments || []).filter(s => s.text && s.text.trim());
     if (!segs.length) throw new Error('요약할 텍스트가 없습니다.');
     const speakers = note.speakers || [];
+    const nameOf = (i) => (speakers[i] && speakers[i].name) || ('참석자 ' + ((i || 0) + 1));
     const transcript = segs.map(s => {
-      const name = (speakers[s.speaker] && speakers[s.speaker].name) || ('참석자 ' + ((s.speaker || 0) + 1));
-      return '[' + VN.util.fmtTime(s.start) + '] ' + name + ': ' + s.text;
+      return '[' + VN.util.fmtTime(s.start) + '] ' + nameOf(s.speaker) + ': ' + s.text;
     }).join('\n').slice(0, 100000);
+    const attendees = [...new Set(segs.map(s => s.speaker || 0))].sort((a, b) => a - b).map(nameOf);
 
-    const prompt = '다음은 음성 녹음의 전사 텍스트입니다. 아래 JSON 형식으로만 답하세요(다른 텍스트 금지).\n' +
-      '{"summary":"3~5문장 요약","topics":[{"title":"소제목","summary":"한 문장 요약","start":초(number)}],' +
-      '"todos":["할 일 항목"],"keywords":["키워드"]}\n' +
-      'topics의 start는 해당 구간이 시작되는 초 단위 숫자입니다. keywords는 5~8개.\n\n' +
+    const prompt = '다음은 회의 녹음의 전사 텍스트입니다. 회의록으로 정리해 아래 JSON 형식으로만 답하세요(다른 텍스트 금지).\n' +
+      '{"summary":"핵심 3~5문장","decisions":["결정 사항"],"openIssues":["미결 안건"],' +
+      '"todos":[{"owner":"담당자","task":"할 일","due":"기한"}],' +
+      '"topics":[{"title":"소제목","summary":"한 문장 요약","start":초(number)}],"keywords":["키워드"]}\n' +
+      '규칙:\n' +
+      '- summary: 회의 전체 흐름이 드러나는 핵심 3~5문장.\n' +
+      '- decisions: 회의에서 확정된 결정 사항만. 확정되지 않은 내용은 넣지 마세요.\n' +
+      '- openIssues: 결론 없이 남은 논의나 보류된 안건.\n' +
+      '- todos의 owner는 반드시 다음 참석자 목록에 있는 이름 중 하나만 사용하세요: [' + attendees.join(', ') + ']. ' +
+      '대화에서 담당자가 명확하지 않으면 빈 문자열("")로 두세요. 추측으로 사람을 지정하지 마세요.\n' +
+      '- todos의 due는 대화에 나온 기한 표현을 그대로 쓰고(예: "이번 주 금요일", "8월 15일"), 언급이 없으면 빈 문자열("").\n' +
+      '- topics의 start는 해당 구간이 시작되는 초 단위 숫자입니다. keywords는 5~8개.\n' +
+      '- 한국어로 답하되, 회의에서 실제로 사용된 용어와 고유명사는 그대로 유지하세요.\n\n' +
       '--- 전사 ---\n' + transcript;
 
-    const resp = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent', {
+    const resp = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -175,11 +260,7 @@ VN.summarizer = (function () {
       },
       body: JSON.stringify({
         contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        generationConfig: {
-          responseMimeType: 'application/json',
-          temperature: 0.3,
-          thinkingConfig: { thinkingBudget: 0 }
-        }
+        generationConfig: buildGenerationConfig(model, 0.3)
       })
     });
     if (!resp.ok) {
@@ -196,18 +277,11 @@ VN.summarizer = (function () {
     if (jsonStart > 0) text = text.slice(jsonStart);
     let parsed;
     try { parsed = JSON.parse(text); } catch (e) { throw new Error('API 응답을 해석하지 못했습니다.'); }
-    return {
-      mode: 'gemini',
-      summary: String(parsed.summary || ''),
-      topics: Array.isArray(parsed.topics) ? parsed.topics.map(t => ({
-        title: String(t.title || ''), summary: String(t.summary || ''), start: Number(t.start) || 0
-      })) : [],
-      todos: Array.isArray(parsed.todos) ? parsed.todos.map(String) : [],
-      keywords: Array.isArray(parsed.keywords) ? parsed.keywords.map(String) : []
-    };
+    return normalizeSummary(Object.assign({ mode: 'gemini', model: model }, parsed));
   }
 
-  /* ── Gemini 오디오 전사: Blob(≤18MB)을 inlineData로 보내 화자 라벨 세그먼트 획득 ── */
+  /* ── Gemini 오디오 전사: Blob(≤18MB)을 inlineData로 보내 화자 라벨 세그먼트 획득
+       (오디오 전사는 비용이 커서 요약 모델 선택과 무관하게 TRANSCRIBE_MODEL 고정) ── */
   async function transcribeAudioGemini(blob, opts) {
     opts = opts || {};
     const apiKey = await VN.db.getSetting('geminiApiKey', '');
@@ -221,7 +295,7 @@ VN.summarizer = (function () {
     const prompt = '첨부된 오디오 전체를 ' + langLabel + '로 전사하세요. ' +
       '각 발화를 {"start": 발화 시작 시각(초, number), "speaker": "참석자1"|"참석자2"|… (목소리로 화자 추정), "text": "발화 내용"} ' +
       '객체로 하는 JSON 배열만 출력하세요. 다른 텍스트 금지. 무음 구간은 건너뛰세요.';
-    const resp = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent', {
+    const resp = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + TRANSCRIBE_MODEL + ':generateContent', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
       body: JSON.stringify({
@@ -232,11 +306,7 @@ VN.summarizer = (function () {
             { inlineData: { mimeType: blob.type || 'audio/webm', data: b64 } }
           ]
         }],
-        generationConfig: {
-          responseMimeType: 'application/json',
-          temperature: 0.2,
-          thinkingConfig: { thinkingBudget: 0 }
-        }
+        generationConfig: buildGenerationConfig(TRANSCRIBE_MODEL, 0.2)
       })
     });
     if (!resp.ok) {
@@ -266,7 +336,8 @@ VN.summarizer = (function () {
     const apiKey = await VN.db.getSetting('geminiApiKey', '');
     if (apiKey) {
       try {
-        return await runGemini(note, apiKey);
+        const model = pickModel(await VN.db.getSetting('geminiModel', DEFAULT_MODEL));
+        return await runGemini(note, apiKey, model);
       } catch (e) {
         const local = runLocal(note);
         local.fallbackReason = 'Gemini API 실패로 기본 모드로 생성했습니다: ' + (e.message || e);
@@ -276,5 +347,10 @@ VN.summarizer = (function () {
     return runLocal(note);
   }
 
-  return { run, runLocal, runGemini, transcribeAudioGemini, summarize, splitTopics, extractTodos, keywords, tokenize };
+  return {
+    run, runLocal, runGemini, transcribeAudioGemini,
+    summarize, splitTopics, extractTodos, keywords, tokenize,
+    normalizeSummary, normalizeTodos, groupTodosByOwner,
+    SUMMARY_MODELS, DEFAULT_MODEL, TRANSCRIBE_MODEL
+  };
 })();
