@@ -393,6 +393,16 @@ window.__vnDebug = {
   }
   await VN.ui.init();
 
+  // 로컬 복사본 구분 배지 — 실사용 주소(배포)와 저장소가 분리돼 있어 혼동 방지
+  if (/^(localhost|127\.0\.0\.1)$/.test(location.hostname)) {
+    const b = document.createElement('a');
+    b.href = 'https://voicenote-l0ox.onrender.com';
+    b.textContent = '🧪 로컬 테스트 복사본 — 실사용(키·노트 저장)은 voicenote-l0ox.onrender.com';
+    b.style.cssText = 'position:fixed;bottom:0;left:0;right:0;z-index:9999;text-align:center;' +
+      'padding:6px 10px;font-size:12px;background:#7c5c00;color:#fff;text-decoration:none;opacity:.95';
+    document.body.appendChild(b);
+  }
+
   // PWA 서비스 워커 (network-first — sw.js 참고)
   if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1')) {
     navigator.serviceWorker.register('sw.js').catch(() => { /* 등록 실패해도 앱 동작에는 영향 없음 */ });
