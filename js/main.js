@@ -342,6 +342,42 @@ window.__vnDebug = {
         'quality=' + JSON.stringify((q || {}).thinkingConfig || null) + ' speed=' + JSON.stringify((s || {}).thinkingConfig || null));
     } catch (e) { t('summarizer.qualityMode', false, String(e)); }
 
+    // 16) 로컬 주제/키워드 — 연결어미로 끝나는 토큰("했는지", "모르겠으나" 등) 제외
+    try {
+      const n2 = VN.db.newNote({
+        segments: [{
+          id: 'e1', speaker: 0, start: 0, end: 5,
+          text: '오늘은 뭘 했는지 모르겠으나 오늘도 아무튼 열심히 살았다',
+          bookmarked: false, highlighted: false
+        }]
+      });
+      const topic = VN.drive.localTopic(n2);
+      const kws = VN.summarizer.keywords(n2.segments[0].text, 8);
+      t('drive.localTopicEndings',
+        topic.length > 0 && topic.indexOf('했는지') === -1 && topic.indexOf('모르겠으나') === -1 &&
+        kws.indexOf('했는지') === -1 && kws.indexOf('모르겠으나') === -1,
+        'topic=' + topic + ' kws=' + kws.join(','));
+    } catch (e) { t('drive.localTopicEndings', false, String(e)); }
+
+    // 17) 백업 직렬화에 민감 설정(API 키·구글 토큰·폴더 핸들) 부재 + 복원 시 무시
+    try {
+      const SENS = ['geminiApiKey', 'deepgramApiKey', 'assemblyaiApiKey', 'googleToken', 'driveDirHandle'];
+      const prevRow = await VN.db.get('settings', 'deepgramApiKey'); // 원상복구용
+      await VN.db.setSetting('deepgramApiKey', '__vntest-secret');
+      const bk2 = await VN.db.backup(false);
+      const leaked = JSON.stringify(bk2).indexOf('__vntest-secret') !== -1 ||
+        (bk2.settings || []).some(s => SENS.indexOf(s.key) !== -1);
+      // 복원 시 민감 키가 들어 있어도 무시하는지 (notes/settings 외 데이터는 건드리지 않음)
+      await VN.db.restoreBackup({ app: 'voicenote', notes: [], settings: [{ key: 'deepgramApiKey', value: '__vntest-inject' }] });
+      const afterRestore = await VN.db.getSetting('deepgramApiKey', '');
+      if (prevRow) await VN.db.put('settings', prevRow); else await VN.db.del('settings', 'deepgramApiKey');
+      t('db.backupSensitiveKeys', !leaked && afterRestore === '__vntest-secret',
+        'leaked=' + leaked + ' restoreIgnored=' + (afterRestore === '__vntest-secret'));
+    } catch (e) {
+      try { await VN.db.del('settings', 'deepgramApiKey'); } catch (e2) { /* ignore */ }
+      t('db.backupSensitiveKeys', false, String(e));
+    }
+
     console.table(results);
     return results;
   }

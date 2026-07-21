@@ -24,6 +24,9 @@ VN.summarizer = (function () {
     '으로', '까지', '부터', '처럼', '보다', '하고', '이나', '이며', '이랑', '랑', '과', '와', '은', '는',
     '이', '가', '을', '를', '의', '에', '로', '도', '만', '요'];
 
+  /* 연결·종결 어미로 끝나는 토큰은 키워드/주제에서 제외 ("했는지", "모르겠으나" 등 — 제목 품질) */
+  const ENDING_RE = /(는데|은데|으나|거나|는지|은지|을지|어서|아서|해서|니까|으니까|지만|다가|려고|고요|네요|거든요|습니다|입니다|다면)$/;
+
   function stripJosa(word) {
     if (!/[가-힣]$/.test(word)) return word;
     for (const j of JOSA) {
@@ -36,7 +39,8 @@ VN.summarizer = (function () {
     const raw = String(text || '').toLowerCase()
       .replace(/[^\p{L}\p{N}\s]/gu, ' ')
       .split(/\s+/).filter(w => w.length >= 2);
-    return raw.map(stripJosa).filter(w => w.length >= 2 && !STOPWORDS.has(w) && !/^\d+$/.test(w));
+    return raw.map(stripJosa).filter(w =>
+      w.length >= 2 && !STOPWORDS.has(w) && !/^\d+$/.test(w) && !ENDING_RE.test(w));
   }
 
   function freqMap(tokens) {
@@ -48,8 +52,10 @@ VN.summarizer = (function () {
   /* ── 키워드 ── */
   function keywords(text, topN) {
     const m = freqMap(tokenize(text));
+    // 빈도 내림차순(빈도≥2가 자연히 우선). 동률은 stable sort로 등장 순서 유지 —
+    // "긴 단어 우선"보다 실제 대화 흐름에 맞는 제목이 나온다.
     return [...m.entries()]
-      .sort((a, b) => b[1] - a[1] || b[0].length - a[0].length)
+      .sort((a, b) => b[1] - a[1])
       .slice(0, topN || 8)
       .map(e => e[0]);
   }
@@ -358,14 +364,15 @@ VN.summarizer = (function () {
     })).filter(x => x.text);
   }
 
-  /* ── 진입점: API 키가 있으면 Gemini, 실패 시 로컬 폴백 ── */
-  async function run(note) {
+  /* ── 진입점: API 키가 있으면 Gemini, 실패 시 로컬 폴백.
+       onRetry(n, total)는 재시도 진행을 UI(버튼 텍스트 등)에 알린다. ── */
+  async function run(note, onRetry) {
     const apiKey = await VN.db.getSetting('geminiApiKey', '');
     if (apiKey) {
       try {
         const model = pickModel(await VN.db.getSetting('geminiModel', DEFAULT_MODEL));
         const quality = pickQuality(await VN.db.getSetting('geminiQuality', DEFAULT_QUALITY));
-        return await runGemini(note, apiKey, model, quality);
+        return await runGemini(note, apiKey, model, quality, onRetry);
       } catch (e) {
         const local = runLocal(note);
         local.fallbackReason = 'Gemini API 실패로 기본 모드로 생성했습니다: ' + (e.message || e);
@@ -379,6 +386,7 @@ VN.summarizer = (function () {
     run, runLocal, runGemini, transcribeAudioGemini,
     summarize, splitTopics, extractTodos, keywords, tokenize,
     normalizeSummary, normalizeTodos, groupTodosByOwner,
+    buildGenerationConfig,
     SUMMARY_MODELS, DEFAULT_MODEL, TRANSCRIBE_MODEL,
     QUALITY_MODES, DEFAULT_QUALITY, pickQuality
   };

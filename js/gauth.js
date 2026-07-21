@@ -135,14 +135,14 @@ VN.gauth = (function () {
     return inflight;
   }
 
-  /* 명시적 로그인(사용자 제스처에서만 호출) */
+  /* 명시적 로그인(사용자 제스처에서만 호출)
+     userinfo(이메일) 조회는 하지 않는다 — 표시도 "로그인됨"만. */
   async function signIn() {
     const clientId = await getClientId();
     if (!clientId) throw new Error('Google 클라이언트 ID가 설정되지 않았습니다.');
     await loadGis();
     const resp = await requestToken(clientId, 'consent');
-    const token = await saveFromResponse(resp);
-    await fetchEmail(token);   // 실패해도 무시
+    await saveFromResponse(resp);
     return true;
   }
 
@@ -154,32 +154,15 @@ VN.gauth = (function () {
       }
     } catch (e) { /* ignore */ }
     await VN.db.setSetting('googleToken', null);
-    await VN.db.setSetting('googleEmail', '');
-  }
-
-  /* 로그인 직후 1회 — 실패해도 조용히 무시 */
-  async function fetchEmail(token) {
-    try {
-      const resp = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
-        headers: { Authorization: 'Bearer ' + token }
-      });
-      if (!resp.ok) return '';
-      const j = await resp.json();
-      const email = j.email || '';
-      if (email) await VN.db.setSetting('googleEmail', email);
-      return email;
-    } catch (e) { return ''; }
+    await VN.db.setSetting('googleEmail', ''); // 이전 버전이 저장한 이메일 흔적 정리
   }
 
   async function status() {
-    const [clientId, tok, email] = await Promise.all([
-      getClientId(), getStoredToken(), VN.db.getSetting('googleEmail', '')
-    ]);
+    const [clientId, tok] = await Promise.all([getClientId(), getStoredToken()]);
     return {
       configured: !!clientId,
       signedIn: isTokenValid(tok, Date.now()),
       hasToken: !!(tok && tok.accessToken),
-      email: email || '',
       expiresAt: (tok && tok.expiresAt) || 0
     };
   }

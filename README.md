@@ -49,7 +49,7 @@
 | 실시간 메모 | 녹음·재생 중 타임스탬프 메모, 편집/삭제/시점 재생 |
 | 북마크 | 녹음 중 시점 북마크 + 세그먼트 북마크 토글 + 모아보기 |
 | 하이라이트 | 세그먼트 형광 강조 + 모아보기 |
-| AI 요약/주요 주제/할 일 | 기본(오프라인 추출 요약) + 고급 모드(Gemini 2.5 Flash, API 키 입력 시), 결과 편집 가능 |
+| AI 요약/주요 주제/할 일 | 기본(오프라인 추출 요약) + 고급 모드(Gemini 3.5 Flash, API 키 입력 시), 결과 편집 가능 |
 | 통화/외부 파일 불러오기 | mp3/m4a/aac/wav/webm/ogg 업로드·드래그&드롭, 파일명으로 통화/회의 자동 태그 |
 | 파일 텍스트 변환 | ① 수동 전사 편집기 ② Whisper AI 변환(옵션, transformers.js CDN, tiny/base) |
 | 재생 동기화 | 현재 구간 하이라이트·자동 스크롤·클릭 재생, 배속 0.5~2.0, ±10초, A-B 반복 |
@@ -79,18 +79,22 @@ Google 계정으로 한 번 로그인해 두면 PC와 Android 어디서든 별�
 업로드 후에는 노트 상세에 **"Drive에서 열기"** 링크가 표시됩니다. 웹훅 경로와 달리 **용량 제한이 없어**
 오디오 동반 저장도 그대로 올라갑니다.
 
-#### Google Cloud 콘솔 설정
+#### Google Cloud 콘솔 설정 (신형 "Google 인증 플랫폼" UI 기준)
 
 1. [console.cloud.google.com](https://console.cloud.google.com) → **새 프로젝트** 생성.
 2. **API 및 서비스 → 라이브러리** → **Google Drive API** 와 **Google Calendar API** 를 각각 **사용 설정**.
-3. **OAuth 동의 화면** → 사용자 유형 **외부** → 앱 이름·사용자 지원 이메일·개발자 연락처 입력 →
-   **테스트 사용자**에 `special.piece0@gmail.com` 추가.
-4. **사용자 인증 정보 → 사용자 인증 정보 만들기 → OAuth 클라이언트 ID** → 애플리케이션 유형
-   **웹 애플리케이션** → **승인된 JavaScript 원본**에 아래 **두 개를 모두** 추가:
+3. **Google 인증 플랫폼**(구 OAuth 동의 화면) → **브랜딩**에서 앱 이름과 사용자 지원 이메일을 입력.
+4. **대상** 탭 → **"외부로 설정"** 버튼으로 사용자 유형을 외부로 지정 →
+   **테스트 사용자**에 본인 이메일(`special.piece0@gmail.com`)을 추가.
+5. **클라이언트** 탭 → **클라이언트 만들기** → 애플리케이션 유형 **웹 애플리케이션** →
+   **승인된 JavaScript 원본**에 아래 **두 개를 모두** 추가 (승인된 리디렉션 URI는 **비워 둡니다**):
    - `https://voicenote-l0ox.onrender.com`
    - `http://localhost:8788`
-5. 생성된 **클라이언트 ID**를 복사해 보이스노트 **설정 → Google 계정 → 클라이언트 ID**에 붙여넣고 저장 →
+6. 발급된 **클라이언트 ID**를 복사해 보이스노트 **설정 → Google 계정 → 클라이언트 ID**에 붙여넣고 저장 →
    **Google 로그인** 버튼을 누릅니다.
+
+> 팁: 로그인 동의 화면에 표시되는 앱 이름은 **브랜딩**에서 언제든 변경할 수 있습니다
+> (현재 사용자 프로젝트는 'slack'으로 표시됨).
 
 테스트 모드(게시 안 함) 상태라 로그인할 때 **"Google에서 확인하지 않은 앱"** 경고가 나옵니다.
 본인 계정으로 본인이 만든 앱에 접속하는 것이므로 **고급 → (앱 이름)(으)로 이동**을 눌러 계속 진행하면 됩니다.
@@ -156,7 +160,7 @@ function out_(o){ return ContentService.createTextOutput(JSON.stringify(o)).setM
 
 ## Gemini 오디오 전사
 
-Gemini API 키가 있으면 오디오(≤18MB)를 `gemini-2.5-flash`에 직접 보내 화자 추정 라벨과
+Gemini API 키가 있으면 오디오(≤18MB)를 `gemini-3.5-flash`에 직접 보내 화자 추정 라벨과
 시작 시각이 붙은 전사를 받습니다. ① 파일 업로드 후 "Gemini AI 변환(권장)" ② 노트 상세의
 🎤 버튼("오디오 전체 재변환") — 기존 세그먼트를 대체하기 전에 확인을 받습니다.
 18MB 초과 오디오는 분할하지 않고 안내만 하며, 이때는 Whisper 변환을 사용하세요.
@@ -187,12 +191,13 @@ A. 파일 업로드 후 "Whisper AI 변환"을 선택하세요(인터넷 필요)
 
 **Q. 다른 컴퓨터로 옮기려면?**
 A. 설정 → 전체 백업(오디오 포함 체크) → 새 기기에서 설정 → 복원.
+백업에는 API 키가 포함되지 않으므로 기기 이전 후 키는 다시 입력하세요.
 
 **Q. AI 요약 품질을 높이고 싶어요.**
-A. 설정에 Gemini API 키를 입력하면 고급 모드(Gemini 2.5 Flash)로 동작합니다. 키는 Google AI Studio(aistudio.google.com/apikey)에서 무료로 발급받을 수 있고 이 브라우저에만 저장됩니다. 키가 없거나 실패하면 오프라인 추출 요약으로 자동 폴백합니다.
+A. 설정에 Gemini API 키를 입력하면 고급 모드(Gemini 3.5 Flash)로 동작합니다. 키는 Google AI Studio(aistudio.google.com/apikey)에서 무료로 발급받을 수 있고 이 브라우저에만 저장됩니다. 키가 없거나 실패하면 오프라인 추출 요약으로 자동 폴백합니다.
 
 ## 개발 메모
 
 - 프레임워크/빌드 도구/npm 없음. `js/*.js`가 전역 네임스페이스 `VN.*`로 로드 순서 고정.
-- 콘솔 테스트 훅: `window.__vnDebug.runSelfTest()` — 요약기·SRT/TXT·검색·바꾸기·DB CRUD·백업 직렬화·Drive 파일명 생성·웹훅 페이로드 직렬화·녹음 복구 스냅샷·Drive multipart 본문 조립·캘린더 이벤트 매핑·토큰 만료 판정(총 14개)을 실제 실행해 `{name, pass, detail}[]` 반환.
+- 콘솔 테스트 훅: `window.__vnDebug.runSelfTest()` — 요약기·요약 스키마 정규화·SRT/TXT/VTT·검색·바꾸기·DB CRUD·백업 직렬화·Drive 파일명 생성·웹훅 페이로드 직렬화·녹음 복구 스냅샷·Drive multipart 본문 조립·캘린더 이벤트 매핑·토큰 만료 판정·요약 품질 모드·로컬 주제 어미 필터·백업 민감정보 제외(총 18개)를 실제 실행해 `{name, pass, detail}[]` 반환.
 - `__vnDebug.seedDemo()`, `__vnDebug.createNoteFromBlob(blob, name)`, `__vnDebug.getState()` 제공.

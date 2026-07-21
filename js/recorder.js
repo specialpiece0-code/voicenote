@@ -207,9 +207,12 @@ VN.recorder = (function () {
     VN.db.clear('recChunks').catch(() => { /* ignore */ });
   }
 
+  /* 녹음 화면 재진입 시 새 캔버스로 파형 출력을 옮긴다 (세션은 그대로 유지) */
+  function bindCanvas(canvas) { waveCanvas = canvas || null; }
+
   return {
     supported,
     get state() { return state; },
-    currentTime, start, pause, resume, stop, cancel, assembleChunks
+    currentTime, start, pause, resume, stop, cancel, assembleChunks, bindCanvas
   };
 })();

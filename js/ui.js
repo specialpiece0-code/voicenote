@@ -162,6 +162,50 @@ VN.ui = (function () {
     return bar;
   }
 
+  /* ── Google 로그인 만료 배너 (Drive·캘린더 공용, 중복 표시 방지) ── */
+  let authExpiredBanner = null;
+  function notifyAuthExpired() {
+    if (authExpiredBanner && authExpiredBanner.isConnected) return;
+    authExpiredBanner = showTopBanner('Google 로그인이 만료되었습니다 — 설정에서 다시 로그인해 주세요.', [
+      { label: '설정으로 이동', primary: true, onClick: () => go('#/settings') }
+    ]);
+  }
+
+  /* ── 배포 감지: sw.js의 CACHE 버전 문자열을 메모리에 보관하고 주기 재조회 ──
+     (하드코딩 상수 없음 — sw.js 캐시 버전을 올릴 때 이 코드는 손대지 않아도 된다) */
+  let deployBaseVer = null;      // 페이지 로드 시점의 버전 (조회 실패 시 null → 감지 비활성)
+  let deployNotified = false;
+  let deployPendingWhileRec = false;
+  async function fetchSwVersion() {
+    try {
+      const resp = await fetch('sw.js', { cache: 'no-store' });
+      if (!resp.ok) return null;
+      const m = (await resp.text()).match(/CACHE\s*=\s*'([^']+)'/);
+      return m ? m[1] : null;
+    } catch (e) { return null; } // 오프라인 등 — 무음 스킵
+  }
+  function showDeployBanner() {
+    if (deployNotified) return;
+    deployNotified = true;
+    showTopBanner('새 버전이 배포되었습니다 — 새로고침', [
+      { label: '새로고침', primary: true, onClick: () => location.reload() }
+    ]);
+  }
+  async function checkDeploy() {
+    if (deployBaseVer == null || deployNotified) return;
+    const v = await fetchSwVersion();
+    if (!v || v === deployBaseVer) return;
+    if (S.rec && S.rec.active) { deployPendingWhileRec = true; return; } // 녹음 중엔 보류
+    showDeployBanner();
+  }
+  function initDeployWatch() {
+    fetchSwVersion().then(v => { deployBaseVer = v; });
+    setInterval(checkDeploy, 30 * 60 * 1000);
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') checkDeploy();
+    });
+  }
+
   /* ── 크래시 세이프: 잔존 녹음 세션 복구 ── */
   async function checkRecovery() {
     let meta = null;
@@ -219,10 +263,10 @@ VN.ui = (function () {
   async function route() {
     // 플레이어 정리 (objectURL 누수 방지)
     if (S.player) { S.player.destroy(); S.player = null; }
-    // 녹음 중 이탈 → 자동 저장
+    // 녹음 중 이탈 → 자동 저장 (Drive 업로드는 finishRecording 안에서 백그라운드 진행)
     if (S.rec && S.rec.active && !location.hash.startsWith('#/record')) {
-      await finishRecording(true);
-      toast('진행 중이던 녹음을 저장했습니다.');
+      const ok = await finishRecording(true);
+      if (ok) toast('진행 중이던 녹음을 저장했습니다.');
     }
     $('#app').classList.remove('sidebar-open');
 
@@ -373,6 +417,8 @@ VN.ui = (function () {
   /* ══════════════ 노트 상세 ══════════════ */
 
   async function viewNote(id) {
+    // route()를 거치지 않는 직접 호출(재변환·일정 연결 후 등)에서도 ObjectURL 누수가 없도록 정리
+    if (S.player) { S.player.destroy(); S.player = null; }
     const note = await VN.db.getNote(id);
     if (!note) { toast('노트를 찾을 수 없습니다.'); go('#/list'); return; }
     S.note = note;
@@ -400,7 +446,8 @@ VN.ui = (function () {
       '<span>' + (LANG_LABEL[note.language] || note.language || '-') + '</span>' +
       (note.tags || []).map(t => '<span class="tag green">#' + U.esc(t) + '</span>').join('') +
       (note.calendar && note.calendar.title ? '<span title="연결된 일정">📅 ' + U.esc(note.calendar.title) + '</span>' : '') +
-      (note.driveLink ? '<span><a href="' + U.esc(note.driveLink) + '" target="_blank" rel="noopener">Drive에서 열기 ↗</a></span>' : '') +
+      (note.driveLink && /^https:\/\//.test(note.driveLink)
+        ? '<span><a href="' + U.esc(note.driveLink) + '" target="_blank" rel="noopener">Drive에서 열기 ↗</a></span>' : '') +
       '<span>📁 <select id="note-folder"><option value="">전체 노트</option>' +
       S.folders.map(f => '<option value="' + f.id + '"' + (note.folderId === f.id ? ' selected' : '') + '>' + U.esc(f.name) + '</option>').join('') +
       '</select></span>' +
@@ -463,6 +510,7 @@ VN.ui = (function () {
         const r = await VN.drive.saveNoteToDrive(note);
         toast(r.message || (r.saved ? 'Drive에 저장했습니다.' : 'Drive 저장을 건너뛰었습니다.'));
         if (r.titleChanged && $('#note-title')) $('#note-title').value = note.title;
+        if (r.authExpired) notifyAuthExpired();
       } catch (e) { toast('Drive 저장 실패: ' + (e.message || e)); }
       b.disabled = false;
     };
@@ -867,6 +915,7 @@ VN.ui = (function () {
 
     const renderResult = () => {
       const el = $('#ai-result');
+      if (!el) return; // 생성 완료 전에 다른 화면으로 이탈 — 결과는 이미 노트에 저장돼 있다
       if (!note.summary) { el.innerHTML = '<div class="empty-state">버튼을 눌러 요약·결정 사항·미결 안건·담당자별 할 일·주제·키워드를 생성하세요.<br><span class="small">모든 결과는 클릭해서 편집할 수 있습니다.</span></div>'; return; }
       // 구형 저장분(문자열 todos·decisions 없음)도 같은 형태로 다루도록 메모리상에서만 정규화
       const sum = VN.summarizer.normalizeSummary(note.summary);
@@ -952,14 +1001,23 @@ VN.ui = (function () {
       const btn = $('#btn-ai-run');
       btn.disabled = true; btn.textContent = '생성 중…';
       try {
-        note.summary = await VN.summarizer.run(note);
+        note.summary = await VN.summarizer.run(note, (n, total) => {
+          const b = $('#btn-ai-run');
+          if (b) b.textContent = '재시도 ' + n + '/' + total + '…';
+        });
         await saveNote(note);
         renderResult();
-        toast('AI 정리를 생성했습니다.');
+        if (note.summary && note.summary.fallbackReason) {
+          // 폴백이면 성공 토스트 대신 사유를 알린다
+          toast(note.summary.fallbackReason + ' — 다시 시도해 보세요.', 5000);
+        } else {
+          toast('AI 정리를 생성했습니다.');
+        }
       } catch (e) {
         toast('생성 실패: ' + (e.message || e));
       }
-      btn.disabled = false; btn.textContent = 'AI 정리 다시 생성';
+      const b = $('#btn-ai-run');
+      if (b) { b.disabled = false; b.textContent = 'AI 정리 다시 생성'; }
     };
   }
 
@@ -1054,6 +1112,9 @@ VN.ui = (function () {
   /* ══════════════ 녹음 화면 ══════════════ */
 
   function viewRecord() {
+    // 녹음이 진행 중인데 다시 진입("● 새 녹음" 재클릭 등)하면 세션을 리셋하지 않고
+    // 기존 녹음 화면을 그대로 재표시한다 — 리셋하면 마이크가 켜진 채 UI만 초기화(고아 세션)된다.
+    const resuming = !!(S.rec && S.rec.active && VN.recorder.state !== 'idle');
     const recSupported = VN.recorder.supported;
     const sttSupported = VN.stt.supported;
     let html = '<div class="view record-wrap">';
@@ -1084,7 +1145,7 @@ VN.ui = (function () {
       '</div></div>';
     main().innerHTML = html;
 
-    VN.db.getSetting('defaultLang', 'ko-KR').then(l => { $('#rec-lang') && ($('#rec-lang').value = l); });
+    if (!resuming) VN.db.getSetting('defaultLang', 'ko-KR').then(l => { $('#rec-lang') && ($('#rec-lang').value = l); });
 
     // Wake Lock 옵션 (미지원 브라우저는 숨김)
     if (!('wakeLock' in navigator)) {
@@ -1097,12 +1158,14 @@ VN.ui = (function () {
       };
     }
 
-    S.rec = {
-      active: false, lang: 'ko-KR',
-      segments: [], memos: [], bookmarks: [],
-      speakers: [{ name: '참석자 1' }, { name: '참석자 2' }, { name: '참석자 3' }],
-      curSpeaker: 0, timerId: null, sttWarned: false
-    };
+    if (!resuming) {
+      S.rec = {
+        active: false, lang: 'ko-KR',
+        segments: [], memos: [], bookmarks: [],
+        speakers: [{ name: '참석자 1' }, { name: '참석자 2' }, { name: '참석자 3' }],
+        curSpeaker: 0, timerId: null, sttWarned: false
+      };
+    }
 
     const renderSpeakers = () => {
       const el = $('#rec-speakers');
@@ -1150,11 +1213,14 @@ VN.ui = (function () {
       });
     })();
 
-    const live = $('#stt-live');
+    // live는 항상 현재 DOM에서 찾는다 — 녹음 중 화면이 재렌더돼도(재진입) 이전에 등록된
+    // STT 콜백이 떨어져 나간 옛 노드가 아니라 새 자막 영역에 계속 출력되게 하기 위함.
+    const live = () => $('#stt-live');
     let interimEl = null;
 
-    const appendFinal = (seg) => {
-      S.rec.segments.push(seg);
+    const renderFinalDom = (seg) => {
+      const box = live();
+      if (!box) return;
       const div = document.createElement('div');
       div.className = 'segment';
       div.innerHTML = '<div class="seg-avatar" style="background:' + speakerColor(seg.speaker) + '">' +
@@ -1162,17 +1228,24 @@ VN.ui = (function () {
         '<div class="seg-body"><div class="seg-head"><span>' + U.esc(S.rec.speakers[seg.speaker].name) + '</span>' +
         '<span>' + U.fmtTime(seg.start) + '</span></div>' +
         '<div class="seg-text">' + U.esc(seg.text) + '</div></div>';
-      if (interimEl) live.insertBefore(div, interimEl); else live.appendChild(div);
-      live.scrollTop = live.scrollHeight;
+      if (interimEl && interimEl.isConnected) box.insertBefore(div, interimEl);
+      else box.appendChild(div);
+      box.scrollTop = box.scrollHeight;
+    };
+    const appendFinal = (seg) => {
+      S.rec.segments.push(seg);
+      renderFinalDom(seg);
     };
     const showInterim = (text) => {
-      if (!interimEl) {
+      const box = live();
+      if (!box) return;
+      if (!interimEl || !interimEl.isConnected) {
         interimEl = document.createElement('div');
         interimEl.className = 'interim';
-        live.appendChild(interimEl);
+        box.appendChild(interimEl);
       }
       interimEl.textContent = text || '';
-      live.scrollTop = live.scrollHeight;
+      box.scrollTop = box.scrollHeight;
     };
 
     const startTimer = () => {
@@ -1247,7 +1320,7 @@ VN.ui = (function () {
       S.rec.active = true;
       S.rec.sttWarned = false;
       if ($('#rec-wakelock') && $('#rec-wakelock').checked) acquireWakeLock();
-      live.innerHTML = '';
+      live().innerHTML = '';
       interimEl = null;
       $('#rec-lang').disabled = true;
       $('#rec-bookmark').disabled = false;
@@ -1280,11 +1353,32 @@ VN.ui = (function () {
       e.target.value = '';
       toast('메모를 기록했습니다. (' + U.fmtTime(VN.recorder.currentTime()) + ')');
     };
+
+    /* 진행 중 세션 재표시 — 데이터·마이크·타이머는 그대로 두고 UI만 복원한다.
+       (기존 timerId interval과 STT 콜백은 DOM을 매번 새로 찾으므로 계속 동작) */
+    if (resuming) {
+      const langSel = $('#rec-lang');
+      if (langSel) { langSel.value = S.rec.lang; langSel.disabled = true; }
+      $('#rec-bookmark').disabled = false;
+      $('#rec-memo').disabled = false;
+      const box = live();
+      if (box) box.innerHTML = '';
+      interimEl = null;
+      for (const seg of S.rec.segments) renderFinalDom(seg);
+      const paused = VN.recorder.state === 'paused';
+      $('#rec-state').innerHTML = paused
+        ? '일시정지됨 <span class="faint">(일시정지 구간은 타임스탬프에서 제외)</span>'
+        : '<span class="rec-dot"></span>녹음 중';
+      setControls(paused ? 'paused' : 'recording');
+      const t = $('#rec-timer');
+      if (t) t.textContent = U.fmtTime(VN.recorder.currentTime());
+      VN.recorder.bindCanvas($('#record-wave'));
+    }
   }
 
-  /* 녹음 종료 → 노트 생성 (silent=true면 화면 전환 없이 저장만) */
+  /* 녹음 종료 → 노트 생성 (silent=true면 화면 전환 없이 저장만). 성공 시 true 반환 */
   async function finishRecording(silent) {
-    if (!S.rec || !S.rec.active) return;
+    if (!S.rec || !S.rec.active) return false;
     S.rec.active = false;
     VN.stt.stop();
     clearInterval(S.rec.timerId);
@@ -1295,7 +1389,7 @@ VN.ui = (function () {
       result = await VN.recorder.stop();
     } catch (e) {
       toast('녹음 저장 실패: ' + (e.message || e));
-      return;
+      return false;
     }
     // 제목: 날짜 + 핵심 키워드
     const d = new Date();
@@ -1323,12 +1417,16 @@ VN.ui = (function () {
     // 노트가 안전하게 저장됐으니 크래시 세이프 청크 정리
     try { await VN.db.clear('recChunks'); } catch (e) { /* ignore */ }
     S.rec = null;
-    // Drive 자동 저장 (주제 생성 → 파일명·노트 제목 확정 → 활성 경로 전부 저장)
-    await driveAutoSaveAfter(note);
+    // 녹음 중 보류해 둔 배포 감지 배너가 있으면 이제 표시
+    if (deployPendingWhileRec) { deployPendingWhileRec = false; showDeployBanner(); }
     if (!silent) {
       toast('노트가 생성되었습니다.');
       go('#/note/' + note.id);
     }
+    // Drive 자동 저장은 화면 전환을 막지 않도록 백그라운드로 진행
+    // (주제 생성 → 파일명·노트 제목 확정 → 저장, 완료/실패는 토스트로 알림)
+    driveAutoSaveAfter(note);
+    return true;
   }
 
   /* ══════════════ 파일 불러오기 ══════════════ */
@@ -1447,8 +1545,8 @@ VN.ui = (function () {
       // deepgram | assemblyai — 새 노트라 대체 확인은 생략
       m.remove();
       const ok = await diarizeTranscribe(note, kind, { confirm: false });
-      if (ok) await driveAutoSaveAfter(note);
       go('#/note/' + note.id);
+      if (ok) driveAutoSaveAfter(note); // 백그라운드 — 화면 전환을 막지 않는다
     });
   }
 
@@ -1577,8 +1675,8 @@ VN.ui = (function () {
         await saveNote(note);
         toast(segs.length + '개 구간을 변환했습니다.');
         m.remove();
-        await driveAutoSaveAfter(note);
         go('#/note/' + note.id);
+        driveAutoSaveAfter(note); // 백그라운드
       } catch (e) {
         const st = $('#wh-status', m);
         if (st) st.innerHTML = '<span style="color:var(--danger)">' + U.esc(e.message || String(e)) + '</span>';
@@ -1608,7 +1706,7 @@ VN.ui = (function () {
   /* 업로드 변환 모달의 Gemini 경로 */
   function geminiTranscribeModal(note) {
     const m = modal('<h2>Gemini AI 변환</h2><div class="modal-body">' +
-      '<p class="muted small" style="margin-bottom:10px">오디오 전체를 Gemini 2.5 Flash에 보내 화자 추정과 함께 전사합니다. (오디오 18MB 이하, 인터넷 필요)</p>' +
+      '<p class="muted small" style="margin-bottom:10px">오디오 전체를 Gemini 3.5 Flash에 보내 화자 추정과 함께 전사합니다. (오디오 18MB 이하, 인터넷 필요)</p>' +
       '<div id="gm-status" class="muted small">준비됨</div>' +
       '</div><div class="modal-actions"><button class="btn" data-x="no">닫기</button>' +
       '<button class="btn btn-primary" id="gm-go">변환 시작</button></div>');
@@ -1623,8 +1721,8 @@ VN.ui = (function () {
         await saveNote(note);
         toast(items.length + '개 발화를 변환했습니다.');
         m.remove();
-        await driveAutoSaveAfter(note);
         go('#/note/' + note.id);
+        driveAutoSaveAfter(note); // 백그라운드
       } catch (e) {
         const st = $('#gm-status', m);
         if (st) st.innerHTML = '<span style="color:var(--danger)">' + U.esc(e.message || String(e)) + '</span>';
@@ -1691,12 +1789,21 @@ VN.ui = (function () {
     };
   }
 
-  /* ── 노트 생성·변환 직후 Drive 자동 저장 ── */
+  /* ── 노트 생성·변환 직후 Drive 자동 저장 (await 없이 백그라운드로 호출됨) ── */
   async function driveAutoSaveAfter(note) {
     try {
       const r = await VN.drive.autoSave(note);
-      if (r && r.saved) toast('Drive 저장 완료: ' + (r.filename || ''));
+      // 저장 중 제목·파일명·링크가 갱신됐으면 지금 열려 있는 같은 노트 화면에 반영
+      if (r && r.titleChanged && S.note && S.note.id === note.id) {
+        S.note.title = note.title;
+        S.note.driveFilename = note.driveFilename;
+        if (note.driveLink) S.note.driveLink = note.driveLink;
+        const ti = $('#note-title');
+        if (ti) ti.value = note.title;
+      }
+      if (r && r.saved) toast('Drive 저장됨: ' + (r.filename || ''));
       else if (r && !r.skipped && r.message) toast(r.message);
+      if (r && r.authExpired) notifyAuthExpired();
       return r;
     } catch (e) { toast('Drive 자동 저장 실패: ' + (e.message || e)); }
   }
@@ -1791,7 +1898,7 @@ VN.ui = (function () {
     html += '<div class="settings-group"><h2>고급 모드(Gemini)</h2>' +
       '<p class="muted small" style="margin-bottom:8px">API 키를 입력하면 요약·결정 사항·미결 안건·담당자별 할 일·주제·키워드를 Gemini가 생성합니다. Google AI Studio(aistudio.google.com/apikey)에서 무료 발급, 브라우저에만 저장됨. 실패 시 기본 모드로 자동 폴백합니다.</p>' +
       '<div class="settings-row"><label>Gemini API 키</label>' +
-      '<input type="password" id="st-apikey" style="flex:1;min-width:160px" placeholder="' + (apiKey ? '저장됨 (••••' + apiKey.slice(-4) + ')' : 'AIza…') + '">' +
+      '<input type="password" id="st-apikey" style="flex:1;min-width:160px" placeholder="' + (apiKey ? '저장됨 (••••' + U.esc(apiKey.slice(-4)) + ')' : 'AIza…') + '">' +
       '<button class="btn btn-sm btn-primary" id="st-apikey-save">저장</button>' +
       (apiKey ? '<button class="btn btn-sm" id="st-apikey-del">삭제</button>' : '') + '</div>' +
       '<div class="settings-row"><label>요약 모델</label><select id="st-gemini-model">' +
@@ -1828,9 +1935,9 @@ VN.ui = (function () {
       (!gStatus.configured
         ? '<span class="muted small">클라이언트 ID를 먼저 저장하세요.</span>'
         : (gStatus.signedIn
-          ? '<span class="small">✅ 로그인됨' + (gStatus.email ? ' — ' + U.esc(gStatus.email) : '') + '</span>'
+          ? '<span class="small">✅ 로그인됨</span>'
           : (gStatus.hasToken
-            ? '<span class="small" style="color:var(--danger)">토큰이 만료되었습니다 — 다시 로그인해 주세요.</span>'
+            ? '<span class="small" style="color:var(--danger)">로그인 만료됨 — 다시 로그인</span>'
             : '<span class="muted small">로그인 안 됨</span>'))) +
       '<button class="btn btn-sm btn-primary" id="ga-signin"' + (gStatus.configured ? '' : ' disabled') + '>' +
       (gStatus.signedIn ? '다시 로그인' : 'Google 로그인') + '</button>' +
@@ -1919,6 +2026,10 @@ VN.ui = (function () {
     html += '</div>';
     main().innerHTML = html;
 
+    /* async 핸들러가 끝났을 때 이미 다른 화면으로 이동했을 수 있다 —
+       설정 화면이 여전히 열려 있을 때만 재렌더한다 (다른 화면을 덮어쓰는 사고 방지) */
+    const rerender = () => { if (location.hash.startsWith('#/settings')) viewSettings(); };
+
     if (navigator.storage && navigator.storage.estimate) {
       navigator.storage.estimate().then(est => {
         const el = $('#st-storage');
@@ -1949,12 +2060,12 @@ VN.ui = (function () {
       if (!v) { toast('API 키를 입력하세요.'); return; }
       await VN.db.setSetting('geminiApiKey', v);
       toast('API 키를 저장했습니다.');
-      viewSettings();
+      rerender();
     };
     if ($('#st-apikey-del')) $('#st-apikey-del').onclick = async () => {
       await VN.db.setSetting('geminiApiKey', '');
       toast('API 키를 삭제했습니다.');
-      viewSettings();
+      rerender();
     };
     VN.db.setSetting('apiKey', ''); // 이전 버전의 API 키 설정값 정리
     /* 키 입력칸에서 Enter 로도 저장되게 (버튼을 못 찾는 경우가 많아 추가) */
@@ -1973,18 +2084,18 @@ VN.ui = (function () {
       try {
         const name = await VN.drive.pickFolder();
         toast('저장 폴더를 설정했습니다: ' + name);
-        viewSettings();
+        rerender();
       } catch (e) { if (!e || e.name !== 'AbortError') toast('폴더 선택 실패: ' + ((e && e.message) || e)); }
     };
     if ($('#dr-perm')) $('#dr-perm').onclick = async () => {
       const p = await VN.drive.requestFolderPermission();
       toast(p === 'granted' ? '폴더 접근이 승인되었습니다.' : '승인되지 않았습니다.');
-      viewSettings();
+      rerender();
     };
     if ($('#dr-unpick')) $('#dr-unpick').onclick = async () => {
       await VN.drive.clearFolder();
       toast('저장 폴더를 해제했습니다.');
-      viewSettings();
+      rerender();
     };
     $('#dr-hook-save').onclick = async () => {
       await VN.db.setSetting('appsScriptUrl', $('#dr-url').value.trim());
@@ -2005,19 +2116,19 @@ VN.ui = (function () {
       if (!v) { toast('키를 입력하세요.'); return; }
       await VN.db.setSetting(KEY_SETTING[id], v);
       toast('키를 저장했습니다.');
-      viewSettings();
+      rerender();
     });
     $$('[data-keydel]').forEach(b => b.onclick = async () => {
       await VN.db.setSetting(KEY_SETTING[b.dataset.keydel], '');
       toast('키를 삭제했습니다.');
-      viewSettings();
+      rerender();
     });
 
     /* Google 계정 */
     $('#ga-clientid-save').onclick = async () => {
       await VN.gauth.setClientId($('#ga-clientid').value.trim());
       toast('클라이언트 ID를 저장했습니다.');
-      viewSettings();
+      rerender();
     };
     $('#ga-signin').onclick = async () => {
       const b = $('#ga-signin');
@@ -2026,12 +2137,12 @@ VN.ui = (function () {
         await VN.gauth.signIn();
         toast('Google 계정에 로그인했습니다.');
       } catch (e) { toast('로그인 실패: ' + ((e && e.message) || e)); }
-      viewSettings();
+      rerender();
     };
     if ($('#ga-signout')) $('#ga-signout').onclick = async () => {
       await VN.gauth.signOut();
       toast('로그아웃했습니다.');
-      viewSettings();
+      rerender();
     };
     $('#ga-refolder').onclick = async () => {
       const b = $('#ga-refolder');
@@ -2040,7 +2151,7 @@ VN.ui = (function () {
         const f = await VN.drive.resolveFolder(true);
         toast('Drive 폴더: ' + f.name);
       } catch (e) { toast('폴더 확인 실패: ' + ((e && e.message) || e)); }
-      viewSettings();
+      rerender();
     };
     $('#st-backup').onclick = async () => {
       const btn = $('#st-backup');
@@ -2155,9 +2266,10 @@ VN.ui = (function () {
       }
     });
 
-    // 크래시 복구·Drive 권한 배너·웹훅 재시도 큐
+    // 크래시 복구·Drive 권한 배너·웹훅 재시도 큐·배포 감지
     checkRecovery();
     checkDrivePermission();
+    initDeployWatch();
     VN.drive.flushRetryQueue().then(r => {
       if (r.sent) toast('대기 중이던 Drive 웹훅 ' + r.sent + '건을 전송했습니다.');
     }).catch(() => { /* ignore */ });
@@ -2169,7 +2281,7 @@ VN.ui = (function () {
   return {
     init, route, go, toast, refresh,
     searchNotes, replaceInNote,        // 순수 함수 (셀프테스트용)
-    importFiles,
+    importFiles, notifyAuthExpired,
     getState() {
       return {
         view: location.hash || '#/list',

@@ -215,14 +215,14 @@ VN.drive = (function () {
     return resp.json();
   }
 
-  /* {configured, signedIn, folderId, folderName} */
+  /* {configured, signedIn, hasToken, folderId, folderName} */
   async function getApiStatus() {
-    let st = { configured: false, signedIn: false, hasToken: false, email: '' };
+    let st = { configured: false, signedIn: false, hasToken: false };
     try { st = await VN.gauth.status(); } catch (e) { /* ignore */ }
     return {
       configured: st.configured,
       signedIn: st.signedIn || st.hasToken,
-      email: st.email,
+      hasToken: !!st.hasToken,
       folderId: await VN.db.getSetting('driveFolderId', ''),
       folderName: await VN.db.getSetting('driveFolderName', '')
     };
@@ -243,43 +243,58 @@ VN.drive = (function () {
     return stamp + '_' + t + '.' + (ext || 'doc');
   }
 
-  /* 로컬 폴백: 키워드 상위 2개 */
+  /* 로컬 폴백: 키워드 상위 2개 (제목 폴백 시 "M월 D일 " 날짜 prefix는 중복 방지를 위해 제거) */
   function localTopic(note) {
     const text = (note.segments || []).map(s => s.text || '').join(' ');
     const kws = text ? VN.summarizer.keywords(text, 2) : [];
-    return kws.join(' ') || sanitizeFilename(note.title || '').slice(0, 15) || '회의록';
+    const titleFallback = sanitizeFilename(note.title || '').replace(/^\d{1,2}월 \d{1,2}일\s*/, '').slice(0, 15).trim();
+    return kws.join(' ') || titleFallback || '회의록';
   }
 
-  /* Gemini로 15자 이내 핵심 주제 생성, 실패·키 없음 시 로컬 폴백 */
+  /* Gemini로 15자 이내 핵심 주제 생성 → {topic, reason}.
+     키 없음·전사 없음은 조용한 로컬 폴백(reason=null), API 실패는 reason에 사유를 실어
+     호출부가 토스트로 알릴 수 있게 한다. 모델은 summarizer.DEFAULT_MODEL을 따라간다. */
   async function generateTopic(note) {
     const apiKey = await VN.db.getSetting('geminiApiKey', '');
+    let reason = null;
     if (apiKey && (note.segments || []).some(s => s.text && s.text.trim())) {
+      const model = VN.summarizer.DEFAULT_MODEL;
       try {
         const head = (note.segments || []).slice(0, 40).map(s => s.text).join(' ').slice(0, 4000);
         const sum = (note.summary && note.summary.summary) || '';
         const prompt = '다음 회의 내용의 핵심 주제를 한국어 15자 이내의 명사구 하나로만 답하세요. 따옴표·마침표·설명 금지.\n\n' +
           (sum ? '[요약]\n' + sum + '\n\n' : '') + '[대화 앞부분]\n' + head;
+        // 요약과 동일한 사고 설정(speed)을 재사용하되, 이 호출은 일반 텍스트 응답이므로 JSON 강제는 해제
+        const genCfg = VN.summarizer.buildGenerationConfig(model, 0.3, 'speed');
+        delete genCfg.responseMimeType;
         const opt = {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
           body: JSON.stringify({
             contents: [{ role: 'user', parts: [{ text: prompt }] }],
-            generationConfig: { temperature: 0.3, thinkingConfig: { thinkingBudget: 0 } }
+            generationConfig: genCfg
           })
         };
-        try { if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) opt.signal = AbortSignal.timeout(12000); } catch (e) { /* ignore */ }
-        const resp = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent', opt);
+        try { if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) opt.signal = AbortSignal.timeout(20000); } catch (e) { /* ignore */ }
+        const resp = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent', opt);
         if (resp.ok) {
           const data = await resp.json();
           let t = (data.candidates && data.candidates[0] && data.candidates[0].content &&
             data.candidates[0].content.parts && data.candidates[0].content.parts[0] &&
             data.candidates[0].content.parts[0].text) || '';
           t = String(t).split('\n')[0].replace(/["'「」『』.]/g, '').trim();
-          if (t) return t.slice(0, 15);
+          if (t) return { topic: t.slice(0, 15), reason: null };
+          reason = 'AI 주제 생성 응답이 비어 키워드 제목을 사용했습니다.';
+        } else {
+          reason = 'AI 주제 생성 실패(HTTP ' + resp.status + ')로 키워드 제목을 사용했습니다.';
         }
-      } catch (e) { /* 폴백 */ }
+      } catch (e) {
+        reason = (e && e.name === 'TimeoutError')
+          ? 'AI 주제 생성이 20초 안에 응답하지 않아 키워드 제목을 사용했습니다.'
+          : 'AI 주제 생성 실패(' + ((e && e.message) || e) + ')로 키워드 제목을 사용했습니다.';
+      }
     }
-    return localTopic(note).slice(0, 15);
+    return { topic: localTopic(note).slice(0, 15), reason };
   }
 
   /* ══════════ A4: 저장 오케스트레이션 ══════════ */
@@ -342,26 +357,43 @@ VN.drive = (function () {
       return { saved: false, noPath: true, message: 'Apps Script URL/토큰이 설정되지 않았습니다.' };
     }
     if (useApi && !apiStatus.signedIn) {
+      const expired = apiStatus.configured && apiStatus.hasToken;
       return {
-        saved: false, noPath: true,
-        message: apiStatus.configured
-          ? 'Google 로그인이 필요합니다. (설정 → Google 계정)'
-          : 'Google 클라이언트 ID가 설정되지 않았습니다. (설정 → Google 계정)'
+        saved: false, noPath: true, authExpired: expired,
+        message: expired
+          ? 'Google 로그인이 만료되었습니다 — 설정에서 다시 로그인해 주세요.'
+          : (apiStatus.configured
+            ? 'Google 로그인이 필요합니다. (설정 → Google 계정)'
+            : 'Google 클라이언트 ID가 설정되지 않았습니다. (설정 → Google 계정)')
       };
     }
 
     const firstSave = !note.driveFilename;
     let filename = note.driveFilename;
+    let topicWarn = '';
     if (firstSave) {
       const calTopic = calendarTopic(note);
-      const topic = calTopic || await generateTopic(note);
-      if (!calTopic && topic) note.title = topic; // 같은 주제로 노트 제목도 갱신 (캘린더 제목은 이미 반영됨)
+      let topic = calTopic;
+      if (!calTopic) {
+        const gen = await generateTopic(note);
+        topic = gen.topic;
+        if (gen.reason) topicWarn = gen.reason;
+        if (topic) {
+          // 노트 제목은 기존 자동 제목 형식("M월 D일 …")을 유지한 채 주제만 교체
+          const d = new Date(note.createdAt || Date.now());
+          note.title = (d.getMonth() + 1) + '월 ' + d.getDate() + '일 ' + topic;
+        }
+      }
       filename = makeFilename(note, topic, fmt);
     }
 
     const content = fmt === 'txt' ? VN.exporter.toTXT(note, {}) : VN.exporter.toDOC(note, {});
     const mime = fmt === 'txt' ? 'text/plain' : 'application/msword';
     const okParts = [], errParts = [];
+    let authExpired = false;
+    const noteAuthError = (e) => {
+      if (/로그인이 (만료|필요)/.test(String((e && e.message) || e || ''))) authExpired = true;
+    };
 
     if (useDir) {
       try {
@@ -391,7 +423,7 @@ VN.drive = (function () {
         const r = await apiUpload(filename, mime, new Blob([content], { type: mime }), folder.id);
         if (r && r.webViewLink) note.driveLink = r.webViewLink;
         okParts.push('Drive API(' + folder.name + ')');
-      } catch (e) { errParts.push('Drive API: ' + (e.message || e)); }
+      } catch (e) { noteAuthError(e); errParts.push('Drive API: ' + (e.message || e)); }
     }
 
     /* 오디오 함께 저장 (옵션) */
@@ -420,16 +452,17 @@ VN.drive = (function () {
           const folder = await resolveFolder(false);
           await apiUpload(audioName, at, note.audioBlob, folder.id);
           okParts.push('오디오(Drive API)');
-        } catch (e) { errParts.push('오디오 Drive API: ' + (e.message || e)); }
+        } catch (e) { noteAuthError(e); errParts.push('오디오 Drive API: ' + (e.message || e)); }
       }
     }
 
     note.driveFilename = filename;
     await VN.db.saveNote(note);
     const message = (okParts.length ? '저장 완료: ' + okParts.join(', ') : '') +
-      (errParts.length ? (okParts.length ? ' / ' : '') + errParts.join(' / ') : '');
+      (errParts.length ? (okParts.length ? ' / ' : '') + errParts.join(' / ') : '') +
+      (topicWarn ? ((okParts.length || errParts.length) ? ' / ' : '') + topicWarn : '');
     await setLastResult(okParts.length > 0 && !errParts.length, message || '저장할 경로가 없습니다.');
-    return { saved: okParts.length > 0, filename, message, titleChanged: firstSave };
+    return { saved: okParts.length > 0, filename, message, titleChanged: firstSave, authExpired };
   }
 
   /* 자동 저장 진입점: 설정 꺼짐/경로 없음이면 조용히 스킵 */
@@ -456,7 +489,8 @@ VN.drive = (function () {
       const api = await getApiStatus();
       if (!api.signedIn) {
         return api.configured
-          ? { saved: false, message: 'Google 로그인이 만료되어 자동 저장을 건너뛰었습니다. (설정에서 재로그인)' }
+          ? { saved: false, authExpired: api.hasToken,
+              message: 'Google 로그인이 만료되어 자동 저장을 건너뛰었습니다. (설정에서 재로그인)' }
           : { saved: false, skipped: true };
       }
     }

@@ -66,7 +66,12 @@ VN.gcal = (function () {
       const j = await resp.json();
       const items = Array.isArray(j.items) ? j.items : [];
       return items.filter(ev => ev && ev.status !== 'cancelled');
-    } catch (e) { return []; }
+    } catch (e) {
+      // 토큰 만료(무음 재발급 실패 포함)는 삼키지 말고 상단 배너로 재로그인 안내
+      if (/로그인이 (만료|필요)/.test(String((e && e.message) || '')) &&
+        VN.ui && VN.ui.notifyAuthExpired) VN.ui.notifyAuthExpired();
+      return [];
+    }
   }
 
   /* 현재시각 ±30분에 걸치는 일정 */

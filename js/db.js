@@ -206,6 +206,11 @@ VN.db = (function () {
   async function setSetting(key, value) { return put('settings', { key, value }); }
 
   /* ── 백업/복원 ── */
+  /* 백업 파일에 넣지 않는 민감 설정 — API 키·구글 토큰(만료시각 포함)·폴더 핸들.
+     복원 시 백업에 들어 있어도 무시한다. (기기 이전 후 키는 다시 입력) */
+  const SENSITIVE_SETTINGS = ['geminiApiKey', 'deepgramApiKey', 'assemblyaiApiKey',
+    'googleToken', 'googleEmail', 'driveDirHandle'];
+
   async function backup(includeAudio) {
     const [notes, folders, trash, settings] = await Promise.all([
       getAll('notes'), getAll('folders'), getAll('trash'), getAll('settings')
@@ -228,7 +233,8 @@ VN.db = (function () {
     return {
       app: 'voicenote', version: 1, exportedAt: Date.now(),
       includeAudio: !!includeAudio,
-      notes: sNotes, folders, trash: sTrash, settings
+      notes: sNotes, folders, trash: sTrash,
+      settings: settings.filter(s => s && SENSITIVE_SETTINGS.indexOf(s.key) === -1)
     };
   }
 
@@ -248,13 +254,14 @@ VN.db = (function () {
     for (const n of data.notes) await put('notes', deserializeNote(n));
     for (const n of (data.trash || [])) await put('trash', deserializeNote(n));
     for (const s of (data.settings || [])) {
-      if (s && s.key) await put('settings', s);
+      if (s && s.key && SENSITIVE_SETTINGS.indexOf(s.key) === -1) await put('settings', s);
     }
     return { notes: data.notes.length, folders: (data.folders || []).length };
   }
 
   async function wipeAll() {
     await clear('notes'); await clear('folders'); await clear('trash'); await clear('settings');
+    await clear('recChunks');
   }
 
   return {

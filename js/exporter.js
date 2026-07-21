@@ -120,11 +120,15 @@ VN.exporter = (function () {
       speakerName(note, s.speaker) + ': ' + s.text + '\r\n'
     ).join('\r\n');
   }
+  /* VTT 큐 텍스트 이스케이프 — & < > 는 마크업으로 해석되므로 치환 */
+  function vttEsc(s) {
+    return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
   function toVTT(note) {
     const segs = (note.segments || []).filter(s => s.text);
     return 'WEBVTT\n\n' + segs.map((s) =>
       vttTime(s.start) + ' --> ' + vttTime(s.end || s.start + 2) + '\n' +
-      '<v ' + speakerName(note, s.speaker) + '>' + s.text + '\n'
+      '<v ' + vttEsc(speakerName(note, s.speaker)) + '>' + vttEsc(s.text) + '\n'
     ).join('\n');
   }
 
