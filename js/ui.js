@@ -83,6 +83,18 @@ VN.ui = (function () {
 
   const LANG_LABEL = { 'ko-KR': '한국어', 'en-US': '영어', 'ja-JP': '일본어', 'zh-CN': '중국어' };
 
+  /* ── 모바일 감지 (순수 함수: 셀프테스트에서 사용) ──
+     모바일에서는 SpeechRecognition이 MediaRecorder와 마이크를 공유하지 못해
+     실시간 자막 대신 녹음 종료 후 사후 전사를 안내한다.
+     iPadOS 데스크톱 모드는 Macintosh UA + 멀티터치로 판별. */
+  function isMobileUA(ua, touchPoints) {
+    if (/Android|iPhone|iPad|iPod/i.test(ua || '')) return true;
+    return /Macintosh/.test(ua || '') && (touchPoints || 0) > 1;
+  }
+  function isMobile() {
+    return isMobileUA(navigator.userAgent, navigator.maxTouchPoints);
+  }
+
   async function refresh() {
     S.notes = await VN.db.getAllNotes();
     S.folders = await VN.db.getFolders();
@@ -363,8 +375,10 @@ VN.ui = (function () {
       '<option value="recent"' + (S.sort === 'recent' ? ' selected' : '') + '>최신순</option>' +
       '<option value="title"' + (S.sort === 'title' ? ' selected' : '') + '>제목순</option>' +
       '<option value="duration"' + (S.sort === 'duration' ? ' selected' : '') + '>길이순</option>' +
-      '</select></div><div id="note-list"></div></div>';
+      '</select></div><div id="note-list"></div>' +
+      '<button class="record-fab" id="record-fab">● 새 녹음</button></div>';
     main().innerHTML = html;
+    $('#record-fab').onclick = () => go('#/record');
 
     const renderCards = () => {
       const q = S.listQuery.trim();
@@ -372,7 +386,16 @@ VN.ui = (function () {
       const list = $('#note-list');
       if (!results.length) {
         list.innerHTML = '<div class="empty-state"><div class="big">🎙️</div>' +
-          (q ? '검색 결과가 없습니다.' : '노트가 없습니다.<br>새 녹음을 시작하거나 오디오 파일을 끌어다 놓아 보세요.') + '</div>';
+          (q ? '검색 결과가 없습니다.'
+            : '노트가 없습니다.<br>새 녹음을 시작하거나 오디오 파일을 끌어다 놓아 보세요.' +
+              '<div class="empty-actions">' +
+              '<button class="btn btn-primary" id="empty-rec">● 새 녹음</button>' +
+              '<button class="btn btn-outline" id="empty-import">파일 불러오기</button></div>') +
+          '</div>';
+        if (!q) {
+          $('#empty-rec').onclick = () => go('#/record');
+          $('#empty-import').onclick = () => $('#file-input').click();
+        }
         return;
       }
       list.innerHTML = results.map(({ note: n, snippet }) => {
@@ -1117,11 +1140,15 @@ VN.ui = (function () {
     const resuming = !!(S.rec && S.rec.active && VN.recorder.state !== 'idle');
     const recSupported = VN.recorder.supported;
     const sttSupported = VN.stt.supported;
+    // 모바일은 SpeechRecognition이 MediaRecorder와 마이크를 공유하지 못해(일부 기기는 녹음이 무음)
+    // 실시간 자막을 끄고 녹음 종료 후 사후 전사를 안내한다.
+    const mobile = isMobile();
+    const MOBILE_NOTICE = '모바일에서는 실시간 자막이 지원되지 않습니다. 녹음을 마치면 자동으로 텍스트 변환을 안내해 드립니다.';
     let html = '<div class="view record-wrap">';
     if (!recSupported) {
       html += '<div class="banner">이 브라우저는 녹음(MediaRecorder)을 지원하지 않습니다. Chrome 또는 Edge를 사용해 주세요.</div>';
     }
-    if (!sttSupported) {
+    if (!sttSupported && !mobile) {
       html += '<div class="banner">이 브라우저는 음성인식(SpeechRecognition)을 지원하지 않아 자막 없이 녹음만 진행됩니다. (Chrome/Edge 권장)</div>';
     }
     html += '<div id="rec-cal"></div>';
@@ -1138,7 +1165,8 @@ VN.ui = (function () {
       '</div>' +
       '<div class="speaker-tabs" id="rec-speakers"></div>' +
       '<div id="rec-warn"></div>' +
-      '<div class="stt-live" id="stt-live"><span class="faint">녹음을 시작하면 실시간 자막이 여기에 표시됩니다.</span></div>' +
+      '<div class="stt-live" id="stt-live"><span class="faint">' +
+      (mobile ? MOBILE_NOTICE : '녹음을 시작하면 실시간 자막이 여기에 표시됩니다.') + '</span></div>' +
       '<div class="record-memo-row">' +
       '<button class="icon-btn" id="rec-bookmark" title="현재 시점 북마크" disabled>🔖</button>' +
       '<input type="text" id="rec-memo" placeholder="타임스탬프 메모 입력 후 Enter" disabled>' +
@@ -1163,7 +1191,7 @@ VN.ui = (function () {
         active: false, lang: 'ko-KR',
         segments: [], memos: [], bookmarks: [],
         speakers: [{ name: '참석자 1' }, { name: '참석자 2' }, { name: '참석자 3' }],
-        curSpeaker: 0, timerId: null, sttWarned: false
+        curSpeaker: 0, timerId: null, sttWarned: false, sttOn: false
       };
     }
 
@@ -1256,6 +1284,13 @@ VN.ui = (function () {
         if (t) t.textContent = cur;
         // 탭 숨김 중에도 1분 간격으로는 동작 → 제목으로 진행 상황 표시
         if (S.rec && S.rec.active) document.title = '● ' + cur + ' 녹음 중 — 보이스노트';
+        // STT 감시(데스크톱): 인식을 시작했는데 15초간 결과가 없으면 1회 비차단 안내
+        if (S.rec && S.rec.active && S.rec.sttOn && !S.rec.sttWarned &&
+            VN.recorder.state === 'recording' && Date.now() - VN.stt.lastResultAt() > 15000) {
+          S.rec.sttWarned = true;
+          const warn = $('#rec-warn');
+          if (warn) warn.innerHTML = '<div class="banner">15초 이상 음성인식 결과가 없습니다. 녹음은 계속 저장되고 있으며, 종료 후 텍스트 변환을 안내해 드립니다.</div>';
+        }
       }, 250);
     };
 
@@ -1277,7 +1312,7 @@ VN.ui = (function () {
           '<button class="btn btn-ghost" id="rec-cancel">취소</button>';
         $('#rec-resume').onclick = () => {
           VN.recorder.resume();
-          if (VN.stt.supported) VN.stt.resume(S.rec.lang);
+          if (S.rec.sttOn) VN.stt.resume(S.rec.lang);
           $('#rec-state').innerHTML = '<span class="rec-dot"></span>녹음 중';
           setControls('recording');
         };
@@ -1320,7 +1355,7 @@ VN.ui = (function () {
       S.rec.active = true;
       S.rec.sttWarned = false;
       if ($('#rec-wakelock') && $('#rec-wakelock').checked) acquireWakeLock();
-      live().innerHTML = '';
+      live().innerHTML = mobile ? '<span class="faint">' + MOBILE_NOTICE + '</span>' : '';
       interimEl = null;
       $('#rec-lang').disabled = true;
       $('#rec-bookmark').disabled = false;
@@ -1328,7 +1363,9 @@ VN.ui = (function () {
       $('#rec-state').innerHTML = '<span class="rec-dot"></span>녹음 중';
       setControls('recording');
       startTimer();
-      if (VN.stt.supported) {
+      // 모바일은 마이크 경합(일부 기기는 녹음 쪽이 무음)을 피하기 위해 STT를 아예 시작하지 않는다
+      if (VN.stt.supported && !mobile) {
+        S.rec.sttOn = true;
         VN.stt.start(S.rec.lang, {
           onInterim: showInterim,
           onFinal: (r) => appendFinal({
@@ -1362,7 +1399,7 @@ VN.ui = (function () {
       $('#rec-bookmark').disabled = false;
       $('#rec-memo').disabled = false;
       const box = live();
-      if (box) box.innerHTML = '';
+      if (box) box.innerHTML = mobile ? '<span class="faint">' + MOBILE_NOTICE + '</span>' : '';
       interimEl = null;
       for (const seg of S.rec.segments) renderFinalDom(seg);
       const paused = VN.recorder.state === 'paused';
@@ -1422,6 +1459,13 @@ VN.ui = (function () {
     if (!silent) {
       toast('노트가 생성되었습니다.');
       go('#/note/' + note.id);
+      // 전사 세그먼트가 없고 오디오가 충분히 길면(≈3초+) 바로 텍스트 변환 안내
+      // (모바일은 실시간 자막이 없어 항상 이 경로를 탄다)
+      if (!note.segments.length && note.audioBlob instanceof Blob && (note.duration || 0) >= 3) {
+        transcribeChoiceModal(note, {
+          intro: '"' + U.esc(note.title) + '" 녹음을 저장했습니다. 실시간 자막이 없어 음성 기록이 비어 있습니다. 어떻게 텍스트로 변환할까요?'
+        });
+      }
     }
     // Drive 자동 저장은 화면 전환을 막지 않도록 백그라운드로 진행
     // (주제 생성 → 파일명·노트 제목 확정 → 저장, 완료/실패는 토스트로 알림)
@@ -1526,10 +1570,12 @@ VN.ui = (function () {
     };
   }
 
-  async function transcribeChoiceModal(note) {
+  async function transcribeChoiceModal(note, opts) {
+    const intro = (opts && opts.intro) ||
+      ('"' + U.esc(note.title) + '" 노트를 만들었습니다. 어떻게 텍스트로 변환할까요?');
     const opt = await transcribeOptionsHtml();
     const m = modal('<h2>텍스트 변환</h2><div class="modal-body">' +
-      '<p class="muted" style="margin-bottom:10px">"' + U.esc(note.title) + '" 노트를 만들었습니다. 어떻게 텍스트로 변환할까요?</p>' +
+      '<p class="muted" style="margin-bottom:10px">' + intro + '</p>' +
       opt.html +
       '<button class="btn btn-ghost btn-block" data-tc="later">나중에 하기</button></div>');
     $$('[data-tc]', m).forEach(b => b.onclick = async () => {
@@ -2259,7 +2305,7 @@ VN.ui = (function () {
       if (document.visibilityState !== 'visible' || !S.rec || !S.rec.active) return;
       const wl = $('#rec-wakelock');
       if (wl && wl.checked) acquireWakeLock();
-      if (VN.stt.supported && !S.rec.sttWarned && Date.now() - VN.stt.lastResultAt() > 60000) {
+      if (S.rec.sttOn && !S.rec.sttWarned && Date.now() - VN.stt.lastResultAt() > 60000) {
         S.rec.sttWarned = true;
         const warn = $('#rec-warn');
         if (warn) warn.innerHTML = '<div class="banner">백그라운드 동안 음성인식이 일부 중단됐을 수 있습니다. 녹음은 계속 저장되고 있으니, 저장 후 노트에서 "오디오 전체 재변환(Gemini)"으로 전체를 다시 전사할 수 있습니다.</div>';
@@ -2280,7 +2326,7 @@ VN.ui = (function () {
 
   return {
     init, route, go, toast, refresh,
-    searchNotes, replaceInNote,        // 순수 함수 (셀프테스트용)
+    searchNotes, replaceInNote, isMobileUA,   // 순수 함수 (셀프테스트용)
     importFiles, notifyAuthExpired,
     getState() {
       return {

@@ -378,6 +378,19 @@ window.__vnDebug = {
       t('db.backupSensitiveKeys', false, String(e));
     }
 
+    // 18) 모바일 UA 감지 (Android/iOS + iPadOS 데스크톱 모드 포함, 데스크톱 제외)
+    try {
+      const f = VN.ui.isMobileUA;
+      t('ui.isMobileUA',
+        f('Mozilla/5.0 (Linux; Android 14; SM-S921N) AppleWebKit/537.36 Chrome/126.0 Mobile Safari/537.36', 5) === true &&
+        f('Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15', 5) === true &&
+        f('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15', 5) === true && // iPadOS 데스크톱 모드
+        f('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36', 0) === false &&
+        f('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15', 0) === false && // 진짜 Mac
+        f('', 0) === false,
+        '');
+    } catch (e) { t('ui.isMobileUA', false, String(e)); }
+
     console.table(results);
     return results;
   }

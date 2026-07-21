@@ -121,6 +121,10 @@ a { color: var(--green-dark); }
 .star { color: var(--warn); }
 .empty-state { text-align: center; color: var(--text-faint); padding: 60px 0; }
 .empty-state .big { font-size: 40px; margin-bottom: 12px; }
+.empty-state .empty-actions { display: flex; gap: 8px; justify-content: center; margin-top: 16px; }
+
+/* 리스트 하단 고정 녹음 버튼 — 모바일(≤760px)에서만 표시 */
+.record-fab { display: none; }
 
 .drop-overlay {
   position: fixed; inset: 0; background: rgba(3,199,90,.12); border: 3px dashed var(--green);
@@ -273,4 +277,14 @@ a { color: var(--green-dark); }
   .view { padding: 52px 14px 80px; }
   .note-title-input { font-size: 17px; }
   .record-timer { font-size: 34px; }
+  .record-fab {
+    display: inline-flex; align-items: center; gap: 6px;
+    position: fixed; right: 16px; bottom: calc(16px + env(safe-area-inset-bottom));
+    z-index: 40; /* 사이드바 백드롭(50)보다 아래 */
+    background: var(--green); color: #fff; border: none; border-radius: 999px;
+    padding: 13px 20px; font-size: 15px; font-weight: 700; box-shadow: var(--shadow);
+  }
+  .record-fab:active { background: var(--green-dark); }
+  /* FAB가 마지막 카드를 가리지 않도록 리스트 하단 여백 확보 */
+  #note-list { padding-bottom: calc(64px + env(safe-area-inset-bottom)); }
 }
