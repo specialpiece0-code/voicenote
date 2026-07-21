@@ -432,10 +432,67 @@ window.__vnDebug = {
       t('transcribe.autoManager',
         c1.join(',') === 'deepgram,assemblyai,gemini' && c2.join(',') === 'gemini' && c3.length === 0 &&
         dn.segments.length === 2 && dn.speakers.length === 2 && dn.segments[1].speaker === 1 &&
-        gn.segments.length === 2 && gn.speakers[1].name === '참석자2' &&
+        dn.speakers[0].name === '참석A' && dn.speakers[1].name === '참석B' &&
+        gn.segments.length === 2 && gn.speakers[0].name === '참석A' && gn.speakers[1].name === '참석B' &&
         gn.segments[0].end === 4 && gn.segments[1].end === 7,
-        'chain=' + c1.join('>'));
+        'chain=' + c1.join('>') + ' speakers=' + gn.speakers.map(s => s.name).join(','));
     } catch (e) { t('transcribe.autoManager', false, String(e)); }
+
+    // 23) 화자 체계 (참석A/B… 기본명 + 아바타 표시 글자)
+    try {
+      const L = VN.util;
+      t('util.speakerNaming',
+        L.speakerLetter(0) === 'A' && L.speakerLetter(25) === 'Z' && L.speakerLetter(26) === 'AA' &&
+        L.speakerDefaultName(0) === '참석A' && L.speakerDefaultName(2) === '참석C' &&
+        L.speakerInitial('참석B') === 'B' && L.speakerInitial('참석AA') === 'AA' &&
+        L.speakerInitial('참석자 3') === '3' && L.speakerInitial('참석자1') === '1' &&
+        L.speakerInitial('김팀장') === '김팀' && L.speakerInitial('') === '?',
+        'A/Z/AA=' + [L.speakerLetter(0), L.speakerLetter(25), L.speakerLetter(26)].join(','));
+    } catch (e) { t('util.speakerNaming', false, String(e)); }
+
+    // 24) 적응형 요약 스키마 정규화 (신형 type·sections·mindmap + 구형 하위 호환 + 깊이·노드 상한)
+    try {
+      const neu = VN.summarizer.normalizeSummary({
+        mode: 'gemini', type: '통화', summary: 's',
+        sections: [{ title: '용건', items: ['요금 문의'] }, { title: '', items: [] }],
+        todos: [], decisions: [],
+        mindmap: { topic: '통화', children: [{ topic: '요금', children: [{ topic: '약정', children: [{ topic: '깊이4' }] }] }] }
+      });
+      const old = VN.summarizer.normalizeSummary({ mode: 'gemini', summary: '예전', todos: ['a'] });
+      const wide = VN.summarizer.normalizeMindmap({
+        topic: 'root',
+        children: Array.from({ length: 40 }, (_, i) => ({ topic: '자식' + i }))
+      });
+      t('summarizer.adaptiveSchema',
+        neu.type === '통화' && neu.sections.length === 1 && neu.sections[0].items[0] === '요금 문의' &&
+        neu.mindmap && neu.mindmap.topic === '통화' &&
+        neu.mindmap.children[0].children[0].topic === '약정' &&
+        neu.mindmap.children[0].children[0].children.length === 0 &&   // 깊이 3 초과 절단
+        old.type === '' && old.sections.length === 0 && old.mindmap === null &&
+        old.todos.length === 1 && old.todos[0].task === 'a' &&          // 구형 하위 호환 유지
+        wide.children.length === 29,                                    // 루트 포함 30개 상한
+        'depth-cut=' + neu.mindmap.children[0].children[0].children.length + ' nodeCap=' + (1 + wide.children.length));
+    } catch (e) { t('summarizer.adaptiveSchema', false, String(e)); }
+
+    // 25) 마인드맵 가로 트리 레이아웃 (깊이→x 열, 줄바꿈·말줄임, 좌표 유한성)
+    try {
+      const lay = VN.summarizer.mindmapLayout({
+        topic: '중심 주제', children: [
+          { topic: '아주 길어서 줄바꿈과 말줄임이 반드시 필요한 주제 이름입니다', children: [{ topic: '세부' }] },
+          { topic: '짧음' }
+        ]
+      });
+      const byDepth = (d) => lay.nodes.filter(n => n.depth === d);
+      const longNode = lay.nodes.find(n => n.text.indexOf('아주 길어서') === 0);
+      const empty = VN.summarizer.mindmapLayout(null);
+      t('summarizer.mindmapLayout',
+        lay.nodes.length === 4 && lay.links.length === 3 && lay.width > 0 && lay.height > 0 &&
+        byDepth(0)[0].x < byDepth(1)[0].x && byDepth(1)[0].x < byDepth(2)[0].x &&
+        longNode.lines.length === 2 && longNode.lines[1].slice(-1) === '…' &&
+        lay.nodes.every(n => isFinite(n.x) && isFinite(n.y) && n.w > 0 && n.h > 0 && n.y >= 0) &&
+        empty.nodes.length === 0 && empty.links.length === 0,
+        'nodes=' + lay.nodes.length + ' size=' + lay.width + 'x' + lay.height);
+    } catch (e) { t('summarizer.mindmapLayout', false, String(e)); }
 
     // 18) 모바일 UA 감지 (Android/iOS + iPadOS 데스크톱 모드 포함, 데스크톱 제외)
     try {

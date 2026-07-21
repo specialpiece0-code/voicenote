@@ -54,6 +54,25 @@ VN.util = {
     const arr = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
     return new Blob([arr], { type: type || 'application/octet-stream' });
+  },
+  /* ── 화자 체계 (순수 함수 — 셀프테스트 커버) ──
+     기본 화자명은 "참석A", "참석B" … 형식 — 색이 아니라 글자로 구분해
+     필터링·아바타에서 한눈에 식별되게 한다. 26명 초과는 AA, AB… */
+  speakerLetter(i) {
+    i = Math.max(0, i | 0);
+    let s = '';
+    do { s = String.fromCharCode(65 + (i % 26)) + s; i = Math.floor(i / 26) - 1; } while (i >= 0);
+    return s;
+  },
+  speakerDefaultName(i) { return '참석' + VN.util.speakerLetter(i); },
+  /* 아바타 표시 글자: "참석A" → "A", 구형 "참석자 3"/"참석자3" → "3", 그 외 앞 2글자 */
+  speakerInitial(name) {
+    name = String(name || '').trim();
+    let m = /^참석([A-Z]{1,2})$/.exec(name);
+    if (m) return m[1];
+    m = /^참석자\s?(\d+)$/.exec(name);
+    if (m) return m[1];
+    return name.slice(0, 2) || '?';
   }
 };
 
@@ -132,7 +151,7 @@ VN.db = (function () {
       audioType: '',
       sourceType: 'record', // record | upload | demo
       tags: [],
-      speakers: [{ name: '참석자 1' }],
+      speakers: [{ name: '참석A' }],
       segments: [],         // {id, speaker, start, end, text, bookmarked, highlighted}
       memos: [],            // {id, time, text, createdAt}
       bookmarks: [],        // {id, time} 녹음 중 시점 북마크

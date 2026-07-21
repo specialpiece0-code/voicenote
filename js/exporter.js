@@ -11,7 +11,7 @@ VN.exporter = (function () {
 
   function speakerName(note, idx) {
     const sp = (note.speakers || [])[idx];
-    return (sp && sp.name) || ('참석자 ' + ((idx || 0) + 1));
+    return (sp && sp.name) || VN.util.speakerDefaultName(idx || 0);
   }
 
   function srtTime(sec) {
@@ -45,7 +45,13 @@ VN.exporter = (function () {
       const sum = normSummary(note.summary);
       lines.push('');
       lines.push('--- AI 요약 ---');
+      if (sum.type) lines.push('유형: ' + sum.type);
       lines.push(sum.summary);
+      for (const sec of sum.sections) {
+        lines.push('');
+        lines.push(sec.title + ':');
+        for (const it of sec.items) lines.push('- ' + it);
+      }
       if (sum.decisions.length) {
         lines.push('');
         lines.push('결정 사항:');
@@ -90,7 +96,11 @@ VN.exporter = (function () {
     }
     if (note.summary && note.summary.summary) {
       const sum = normSummary(note.summary);
-      body += '<h2>AI 요약</h2><p>' + esc(sum.summary).replace(/\n/g, '<br>') + '</p>';
+      body += '<h2>AI 요약' + (sum.type ? ' <span style="font-size:12px;color:#02A94D">[' + esc(sum.type) + ']</span>' : '') + '</h2>' +
+        '<p>' + esc(sum.summary).replace(/\n/g, '<br>') + '</p>';
+      for (const sec of sum.sections) {
+        body += '<h3>' + esc(sec.title) + '</h3><ul>' + sec.items.map(it => '<li>' + esc(it) + '</li>').join('') + '</ul>';
+      }
       if (sum.decisions.length) {
         body += '<h3>결정 사항</h3><ul>' + sum.decisions.map(d => '<li>' + esc(d) + '</li>').join('') + '</ul>';
       }
@@ -227,7 +237,8 @@ VN.exporter = (function () {
 '  var el=document.getElementById("root");\n' +
 '  var h="<h1>"+esc(d.title)+"</h1><div class=meta>"+new Date(d.createdAt).toLocaleString("ko-KR")+" · 길이 "+fmt(d.duration)+" · 보이스노트로 공유됨</div>";\n' +
 '  if(d.audioDataURL)h+="<audio controls src=\\""+d.audioDataURL+"\\"></audio>";\n' +
-'  if(d.summary&&d.summary.summary){h+="<div class=box><h2>AI 요약</h2><div>"+esc(d.summary.summary).replace(/\\n/g,"<br>")+"</div>";\n' +
+'  if(d.summary&&d.summary.summary){h+="<div class=box><h2>AI 요약"+(d.summary.type?" · "+esc(d.summary.type):"")+"</h2><div>"+esc(d.summary.summary).replace(/\\n/g,"<br>")+"</div>";\n' +
+'    if(d.summary.sections&&d.summary.sections.length){d.summary.sections.forEach(function(s){h+="<h2 style=margin-top:12px>"+esc(s.title)+"</h2><ul>";(s.items||[]).forEach(function(x){h+="<li>"+esc(x)+"</li>"});h+="</ul>"})}\n' +
 '    if(d.summary.decisions&&d.summary.decisions.length){h+="<h2 style=margin-top:12px>결정 사항</h2><ul>";d.summary.decisions.forEach(function(x){h+="<li>"+esc(x)+"</li>"});h+="</ul>"}\n' +
 '    if(d.summary.openIssues&&d.summary.openIssues.length){h+="<h2 style=margin-top:12px>미결 안건</h2><ul>";d.summary.openIssues.forEach(function(x){h+="<li>"+esc(x)+"</li>"});h+="</ul>"}\n' +
 '    if(d.summary.todos&&d.summary.todos.length){h+="<h2 style=margin-top:12px>담당자별 할 일</h2><ul>";d.summary.todos.forEach(function(t){\n' +
@@ -237,8 +248,9 @@ VN.exporter = (function () {
 '    h+="</div>"}\n' +
 '  h+="<div class=box><h2>음성 기록</h2>";\n' +
 '  (d.segments||[]).forEach(function(s){\n' +
-'    var nm=(d.speakers&&d.speakers[s.speaker]&&d.speakers[s.speaker].name)||("참석자 "+((s.speaker||0)+1));\n' +
-'    h+="<div class=seg><div class=sp style=\\"background:"+COLORS[(s.speaker||0)%COLORS.length]+"\\">"+esc(nm.slice(0,2))+"</div>"+\n' +
+'    var nm=(d.speakers&&d.speakers[s.speaker]&&d.speakers[s.speaker].name)||("참석"+String.fromCharCode(65+((s.speaker||0)%26)));\n' +
+'    var mA=/^참석([A-Z]{1,2})$/.exec(nm),mN=/^참석자\\s?(\\d+)$/.exec(nm),av=mA?mA[1]:(mN?mN[1]:nm.slice(0,2));\n' +
+'    h+="<div class=seg><div class=sp style=\\"background:"+COLORS[(s.speaker||0)%COLORS.length]+"\\">"+esc(av)+"</div>"+\n' +
 '      "<div><div class=t>"+esc(nm)+" · "+fmt(s.start)+"</div><div"+(s.highlighted?" class=hl":"")+">"+esc(s.text)+"</div></div></div>";\n' +
 '  });\n' +
 '  h+="</div>";\n' +

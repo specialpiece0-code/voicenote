@@ -51,7 +51,7 @@ VN.transcribe = (function () {
     let maxSp = 0;
     for (const s of segs) maxSp = Math.max(maxSp, Math.max(0, s.speaker | 0));
     const speakers = [];
-    for (let i = 0; i <= maxSp; i++) speakers.push({ name: '참석자 ' + (i + 1) });
+    for (let i = 0; i <= maxSp; i++) speakers.push({ name: VN.util.speakerDefaultName(i) });
     note.speakers = speakers;
     note.segments = segs.map(s => {
       const start = Number(s.start) || 0;
@@ -67,12 +67,13 @@ VN.transcribe = (function () {
     });
   }
 
-  /* Gemini 결과 (speakerLabel: '참석자1' 등 문자열 라벨) */
+  /* Gemini 결과 (speakerLabel: '참석자1' 등 문자열 라벨) —
+     라벨을 등장 순서대로 새 화자 체계(참석A, 참석B…)에 매핑한다 */
   function applyGeminiSegments(note, items) {
     const labels = [];
     for (const it of items) if (!labels.includes(it.speakerLabel)) labels.push(it.speakerLabel);
-    if (!labels.length) labels.push('참석자 1');
-    note.speakers = labels.map(l => ({ name: l }));
+    if (!labels.length) labels.push('참석자1');
+    note.speakers = labels.map((l, i) => ({ name: VN.util.speakerDefaultName(i) }));
     note.segments = items.map((it, i) => ({
       id: VN.util.uid(),
       speaker: Math.max(0, labels.indexOf(it.speakerLabel)),

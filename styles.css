@@ -155,7 +155,7 @@ a { color: var(--green-dark); }
 .tab.active { color: var(--green-dark); border-bottom-color: var(--green); }
 
 .seg-toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
-.filter-chip { border: 1px solid var(--border); background: var(--bg); border-radius: 999px; padding: 4px 12px; font-size: 13px; color: var(--text-sub); }
+.filter-chip { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--border); background: var(--bg); border-radius: 999px; padding: 4px 12px; font-size: 13px; color: var(--text-sub); }
 .filter-chip.on { border-color: var(--green); color: var(--green-dark); background: var(--green-soft); font-weight: 600; }
 
 .segment { display: flex; gap: 10px; padding: 8px 10px; border-radius: 8px; margin-bottom: 2px; }
@@ -193,6 +193,21 @@ a { color: var(--green-dark); }
 .ai-editable:hover { border-color: var(--border); }
 .ai-editable:focus { outline: 2px solid var(--green); }
 .kw-chip { display: inline-block; background: var(--green-soft); color: var(--green-dark); border-radius: 999px; padding: 3px 10px; margin: 2px 4px 2px 0; font-size: 13px; }
+
+/* ── 노트 헤더 ⋯ 더보기 (데스크톱: 버튼 인라인 그대로, 모바일: 드롭다운) ── */
+.nt-more-wrap { display: contents; }
+#btn-more { display: none; }
+.nt-more-menu { display: contents; }
+.nt-lbl { display: none; }
+
+/* ── 마인드맵 ── */
+.mindmap-scroll { overflow-x: auto; padding: 4px 0; -webkit-overflow-scrolling: touch; }
+.mindmap-svg { display: block; font-family: inherit; }
+
+/* ── AI에게 질문 ── */
+.ask-item { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; }
+.ask-item .ask-q { font-weight: 600; margin-bottom: 4px; }
+.ask-item .ask-a { white-space: pre-wrap; color: var(--text); }
 
 .speaker-legend { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 8px; }
 .speaker-legend .sp { display: flex; align-items: center; gap: 6px; font-size: 13px; }
@@ -287,4 +302,33 @@ a { color: var(--green-dark); }
   .record-fab:active { background: var(--green-dark); }
   /* FAB가 마지막 카드를 가리지 않도록 리스트 하단 여백 확보 */
   #note-list { padding-bottom: calc(64px + env(safe-area-inset-bottom)); }
+
+  /* ── 터치 타겟: 주요 버튼·칩·아이콘 최소 40px ── */
+  .btn, .icon-btn, .filter-chip, .tab, .speaker-tab { min-height: 40px; }
+  .icon-btn { min-width: 40px; }
+  select, input[type="search"], input[type="text"], input[type="password"] { min-height: 40px; }
+
+  /* ── 리스트 헤더: 제목 1줄 + 검색창·정렬 1줄 ── */
+  .view-header h1 { width: 100%; }
+  .searchbar { flex: 1; min-width: 0; max-width: none; }
+  #list-sort { flex: 0 0 auto; }
+
+  /* ── 노트 상단 압축: 제목 1줄 + 메타 1줄(가로 스크롤) ── */
+  .note-info { flex-wrap: nowrap; overflow-x: auto; -webkit-overflow-scrolling: touch; padding-bottom: 4px; }
+  .note-info > span { flex: 0 0 auto; white-space: nowrap; }
+
+  /* ── 노트 헤더 ⋯ 메뉴: 부가 동작을 드롭다운으로 접기 ── */
+  .nt-more-wrap { display: inline-flex; position: relative; }
+  #btn-more { display: inline-flex; }
+  .nt-more-menu { display: none; position: absolute; right: 0; top: calc(100% + 6px); z-index: 70;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow);
+    padding: 6px; flex-direction: column; gap: 4px; min-width: 170px; }
+  .nt-more-wrap.open .nt-more-menu { display: flex; }
+  .nt-more-menu .icon-btn { border: none; justify-content: flex-start; display: inline-flex; align-items: center; text-align: left; }
+  .nt-lbl { display: inline; }
+
+  /* ── 세그먼트 액션: 호버 없이 항상 표시, 겹치지 않게 줄바꿈 허용 ── */
+  .seg-head { flex-wrap: wrap; row-gap: 2px; }
+  .seg-actions { display: flex; gap: 4px; }
+  .seg-actions button { min-height: 40px; min-width: 36px; font-size: 15px; }
 }

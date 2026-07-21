@@ -165,10 +165,43 @@ VN.summarizer = (function () {
     return Array.isArray(arr) ? arr.map(x => String(x == null ? '' : x).trim()).filter(Boolean) : [];
   }
 
+  /* 마인드맵 정규화 (순수 함수 — 셀프테스트 커버)
+     깊이 최대 3(중심 주제 포함), 노드 총 30개 이내로 자른다. 없으면 null. */
+  const MINDMAP_MAX_DEPTH = 2;   // 0(중심)~2 → 3단계
+  const MINDMAP_MAX_NODES = 30;
+
+  function normalizeMindmap(mm) {
+    if (!mm || typeof mm !== 'object') return null;
+    let count = 0;
+    const walk = (node, depth) => {
+      if (!node || typeof node !== 'object' || count >= MINDMAP_MAX_NODES) return null;
+      const topic = String(node.topic || '').trim();
+      if (!topic) return null;
+      count++;
+      const out = { topic, children: [] };
+      if (depth < MINDMAP_MAX_DEPTH && Array.isArray(node.children)) {
+        for (const c of node.children) {
+          const w = walk(c, depth + 1);
+          if (w) out.children.push(w);
+        }
+      }
+      return out;
+    };
+    return walk(mm, 0);
+  }
+
   function normalizeSummary(sum) {
     if (!sum || typeof sum !== 'object') return sum;
     return Object.assign({}, sum, {
       summary: String(sum.summary || ''),
+      /* 신형(적응형) 필드 — 구형 저장분에는 없으므로 기본값으로 채운다 */
+      type: String(sum.type || ''),
+      sections: Array.isArray(sum.sections) ? sum.sections.map(s => ({
+        title: String((s && s.title) || ''),
+        items: strList(s && s.items)
+      })).filter(s => s.title || s.items.length) : [],
+      mindmap: normalizeMindmap(sum.mindmap),
+      /* 기존 필드 (구형·신형 공통) */
       decisions: strList(sum.decisions),
       openIssues: strList(sum.openIssues),
       todos: normalizeTodos(sum.todos),
@@ -179,6 +212,75 @@ VN.summarizer = (function () {
       })) : [],
       keywords: strList(sum.keywords)
     });
+  }
+
+  /* ── 마인드맵 가로 트리 레이아웃 (순수 함수 — 셀프테스트 커버)
+     깊이 → x 열, 리프를 세로로 쌓고 부모는 자식 가운데에 배치.
+     노드 텍스트는 최대 2줄로 줄바꿈, 넘치면 말줄임. ── */
+  function mindmapLayout(root, opts) {
+    opts = opts || {};
+    const CHAR_W = opts.charW || 13, LINE_H = 18, PAD_X = 10, PAD_Y = 7;
+    const GAP_X = 44, GAP_Y = 10;
+    const MAX_CHARS = opts.maxChars || 12, MAX_LINES = 2;
+    if (!root || !root.topic) return { nodes: [], links: [], width: 0, height: 0 };
+
+    function wrapText(t) {
+      t = String(t || '');
+      const lines = [];
+      for (let i = 0; i < t.length && lines.length < MAX_LINES; i += MAX_CHARS) {
+        lines.push(t.slice(i, i + MAX_CHARS));
+      }
+      if (t.length > MAX_CHARS * MAX_LINES) {
+        lines[MAX_LINES - 1] = lines[MAX_LINES - 1].slice(0, MAX_CHARS - 1) + '…';
+      }
+      return lines.length ? lines : [' '];
+    }
+
+    // 1) 크기·깊이 측정
+    function measure(n, depth) {
+      const lines = wrapText(n.topic);
+      const w = Math.max.apply(null, lines.map(l => l.length)) * CHAR_W + PAD_X * 2;
+      const h = lines.length * LINE_H + PAD_Y * 2;
+      return { text: n.topic, lines, depth, w, h, x: 0, y: 0, children: (n.children || []).map(c => measure(c, depth + 1)) };
+    }
+    const t = measure(root, 0);
+
+    // 2) 열 x 좌표 (깊이별 최대 너비 + 간격)
+    const colW = [];
+    (function scan(n) { colW[n.depth] = Math.max(colW[n.depth] || 0, n.w); n.children.forEach(scan); })(t);
+    const colX = [];
+    let cx = 0;
+    for (let d = 0; d < colW.length; d++) { colX[d] = cx; cx += colW[d] + GAP_X; }
+
+    // 3) y 배치: 리프는 커서 순서대로, 부모는 자식 범위의 가운데
+    let cursor = 0;
+    (function place(n) {
+      n.x = colX[n.depth];
+      if (!n.children.length) { n.y = cursor; cursor += n.h + GAP_Y; }
+      else {
+        n.children.forEach(place);
+        const first = n.children[0], last = n.children[n.children.length - 1];
+        n.y = (first.y + last.y + last.h) / 2 - n.h / 2;
+      }
+    })(t);
+    let minY = Infinity;
+    (function mn(n) { minY = Math.min(minY, n.y); n.children.forEach(mn); })(t);
+    const dy = minY < 0 ? -minY : 0;
+
+    // 4) 노드·링크 방출
+    const nodes = [], links = [];
+    let width = 0, height = 0;
+    (function emit(n) {
+      n.y += dy;
+      nodes.push({ text: n.text, lines: n.lines, depth: n.depth, x: n.x, y: n.y, w: n.w, h: n.h });
+      width = Math.max(width, n.x + n.w);
+      height = Math.max(height, n.y + n.h);
+      for (const c of n.children) {
+        emit(c);
+        links.push({ x1: n.x + n.w, y1: n.y + n.h / 2, x2: c.x, y2: c.y + c.h / 2 });
+      }
+    })(t);
+    return { nodes, links, width: Math.ceil(width) + 2, height: Math.ceil(height) + 2 };
   }
 
   /* 담당자별 그룹 (담당자 없으면 '미지정').
@@ -201,9 +303,13 @@ VN.summarizer = (function () {
     const segs = (note.segments || []).filter(s => s.text && s.text.trim());
     const sentences = segs.map(s => ({ text: s.text, start: s.start, end: s.end }));
     const fullText = sentences.map(s => s.text).join(' ');
+    /* 신형(적응형) 스키마 형태로 감싸 렌더 경로를 단일화한다 (오프라인은 유형 분류 불가 → '기타') */
     return {
       mode: 'local',
+      type: '기타',
       summary: summarize(sentences, 5) || '(요약할 텍스트가 없습니다)',
+      sections: [],
+      mindmap: null,
       decisions: [],
       openIssues: [],
       topics: splitTopics(segs),
@@ -243,39 +349,24 @@ VN.summarizer = (function () {
     return cfg;
   }
 
-  async function runGemini(note, apiKey, model, quality, onRetry) {
-    model = pickModel(model);
-    quality = pickQuality(quality);
+  /* 전사 → 프롬프트용 텍스트·참석자 목록 (요약·Ask AI 공용) */
+  function noteTranscript(note) {
     const segs = (note.segments || []).filter(s => s.text && s.text.trim());
-    if (!segs.length) throw new Error('요약할 텍스트가 없습니다.');
     const speakers = note.speakers || [];
-    const nameOf = (i) => (speakers[i] && speakers[i].name) || ('참석자 ' + ((i || 0) + 1));
-    const transcript = segs.map(s => {
-      return '[' + VN.util.fmtTime(s.start) + '] ' + nameOf(s.speaker) + ': ' + s.text;
-    }).join('\n').slice(0, 100000);
-    const attendees = [...new Set(segs.map(s => s.speaker || 0))].sort((a, b) => a - b).map(nameOf);
+    const nameOf = (i) => (speakers[i] && speakers[i].name) || VN.util.speakerDefaultName(i || 0);
+    return {
+      segs,
+      transcript: segs.map(s =>
+        '[' + VN.util.fmtTime(s.start) + '] ' + nameOf(s.speaker) + ': ' + s.text
+      ).join('\n').slice(0, 100000),
+      attendees: [...new Set(segs.map(s => s.speaker || 0))].sort((a, b) => a - b).map(nameOf)
+    };
+  }
 
-    const prompt = '다음은 회의 녹음의 전사 텍스트입니다. 회의록으로 정리해 아래 JSON 형식으로만 답하세요(다른 텍스트 금지).\n' +
-      '{"summary":"핵심 3~5문장","decisions":["결정 사항"],"openIssues":["미결 안건"],' +
-      '"todos":[{"owner":"담당자","task":"할 일","due":"기한"}],' +
-      '"topics":[{"title":"소제목","summary":"한 문장 요약","start":초(number)}],"keywords":["키워드"]}\n' +
-      '규칙:\n' +
-      '- summary: 회의 전체 흐름이 드러나는 핵심 3~5문장.\n' +
-      '- decisions: 회의에서 확정된 결정 사항만. 확정되지 않은 내용은 넣지 마세요.\n' +
-      '- openIssues: 결론 없이 남은 논의나 보류된 안건.\n' +
-      '- todos의 owner는 반드시 다음 참석자 목록에 있는 이름 중 하나만 사용하세요: [' + attendees.join(', ') + ']. ' +
-      '대화에서 담당자가 명확하지 않으면 빈 문자열("")로 두세요. 추측으로 사람을 지정하지 마세요.\n' +
-      '- todos의 due는 대화에 나온 기한 표현을 그대로 쓰고(예: "이번 주 금요일", "8월 15일"), 언급이 없으면 빈 문자열("").\n' +
-      '- topics의 start는 해당 구간이 시작되는 초 단위 숫자입니다. keywords는 5~8개.\n' +
-      '- 한국어로 답하되, 회의에서 실제로 사용된 용어와 고유명사는 그대로 유지하세요.\n\n' +
-      '--- 전사 ---\n' + transcript;
-
-    /* 무료 등급은 혼잡할 때 503(UNAVAILABLE)/429를 자주 돌려준다. 한 번 실패했다고
-       오프라인 요약으로 내려가면 품질이 크게 떨어지므로 잠시 기다렸다 다시 시도한다. */
-    const body = JSON.stringify({
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      generationConfig: buildGenerationConfig(model, 0.3, quality)
-    });
+  /* ── Gemini 텍스트 생성 공통 헬퍼: 재시도(429/5xx)·45초 타임아웃 포함, 응답 텍스트 반환.
+     무료 등급은 혼잡할 때 503(UNAVAILABLE)/429를 자주 돌려준다. 한 번 실패했다고
+     포기하면 품질이 크게 떨어지므로 잠시 기다렸다 다시 시도한다. ── */
+  async function geminiGenerate(apiKey, model, body, onRetry) {
     const headers = { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey };
     const waits = [3000, 8000, 15000];
     const ATTEMPT_TIMEOUT = 45000; // 응답이 없어도 버튼이 영원히 돌지 않도록 시도마다 상한을 둔다
@@ -302,15 +393,83 @@ VN.summarizer = (function () {
       await new Promise(r => setTimeout(r, waits[attempt]));
     }
     const data = await resp.json();
-    let text = (data.candidates && data.candidates[0] && data.candidates[0].content &&
+    return (data.candidates && data.candidates[0] && data.candidates[0].content &&
       data.candidates[0].content.parts && data.candidates[0].content.parts[0] &&
       data.candidates[0].content.parts[0].text) || '';
+  }
+
+  async function runGemini(note, apiKey, model, quality, onRetry) {
+    model = pickModel(model);
+    quality = pickQuality(quality);
+    const ctx = noteTranscript(note);
+    if (!ctx.segs.length) throw new Error('요약할 텍스트가 없습니다.');
+
+    /* 적응형 요약: 회의 고정 스키마 대신, 모델이 먼저 대화 유형을 분류하고
+       유형에 맞는 섹션을 스스로 구성한다. */
+    const prompt = '다음은 음성 녹음의 전사 텍스트입니다. 먼저 대화 유형을 분류하고' +
+      '(회의/강의·수업/통화/인터뷰/상담/일상대화/발표/기타 중 하나), 유형에 맞게 정리해 아래 JSON 형식으로만 답하세요(다른 텍스트 금지).\n' +
+      '{"type":"유형","summary":"핵심 요약 3~5문장",' +
+      '"sections":[{"title":"섹션명","items":["항목"]}],' +
+      '"todos":[{"owner":"담당자","task":"할 일","due":"기한"}],"decisions":["결정 사항"],' +
+      '"topics":[{"title":"소제목","summary":"한 문장 요약","start":초(number)}],"keywords":["키워드"],' +
+      '"mindmap":{"topic":"중심 주제","children":[{"topic":"하위 주제","children":[{"topic":"세부 항목"}]}]}}\n' +
+      '규칙:\n' +
+      '- sections: 대화 유형에 맞는 섹션을 2~5개 스스로 구성하세요. 예: 강의라면 "핵심 개념"·"예시", ' +
+      '통화라면 "용건"·"합의된 내용", 상담이라면 "고민"·"조언", 일상대화라면 "나눈 이야기" 등. ' +
+      '회의 형식(결정 사항·안건)을 다른 유형에 강요하지 마세요.\n' +
+      '- todos·decisions: 실제로 대화에 존재할 때만 채우고, 없으면 빈 배열 []로 두세요.\n' +
+      '- todos의 owner는 반드시 다음 참석자 목록에 있는 이름 중 하나만 사용하세요: [' + ctx.attendees.join(', ') + ']. ' +
+      '대화에서 담당자가 명확하지 않으면 빈 문자열("")로 두세요. 추측으로 사람을 지정하지 마세요.\n' +
+      '- todos의 due는 대화에 나온 기한 표현을 그대로 쓰고(예: "이번 주 금요일", "8월 15일"), 언급이 없으면 빈 문자열("").\n' +
+      '- 간투사(어/음/그 등), 잡음, 무의미한 반복, 웃음·기침 같은 비언어적 소리는 요약·정리에서 제외하세요.\n' +
+      '- mindmap: 대화 내용을 카테고리로 묶은 주제 계층. 깊이는 중심 주제 포함 최대 3단계, 노드는 총 30개 이내, 각 topic은 20자 이내.\n' +
+      '- topics의 start는 해당 구간이 시작되는 초 단위 숫자입니다. keywords는 5~8개.\n' +
+      '- 한국어로 답하되, 대화에서 실제로 사용된 용어와 고유명사는 그대로 유지하세요.\n\n' +
+      '--- 전사 ---\n' + ctx.transcript;
+
+    const body = JSON.stringify({
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: buildGenerationConfig(model, 0.3, quality)
+    });
+    let text = await geminiGenerate(apiKey, model, body, onRetry);
     text = text.trim().replace(/^```(json)?/i, '').replace(/```$/, '').trim();
     const jsonStart = text.indexOf('{');
     if (jsonStart > 0) text = text.slice(jsonStart);
     let parsed;
     try { parsed = JSON.parse(text); } catch (e) { throw new Error('API 응답을 해석하지 못했습니다.'); }
     return normalizeSummary(Object.assign({ mode: 'gemini', model: model }, parsed));
+  }
+
+  /* ── Ask AI: 전사 전체(+메모)를 컨텍스트로 자유 질문 ──
+     키가 없으면 err.code='no-key'로 던져 UI가 설정 안내를 하게 한다. */
+  async function ask(note, question, onRetry) {
+    question = String(question || '').trim();
+    if (!question) throw new Error('질문을 입력하세요.');
+    const apiKey = await VN.db.getSetting('geminiApiKey', '');
+    if (!apiKey) {
+      const e = new Error('Gemini API 키가 설정되지 않았습니다. (설정 → 고급 모드)');
+      e.code = 'no-key';
+      throw e;
+    }
+    const model = pickModel(await VN.db.getSetting('geminiModel', DEFAULT_MODEL));
+    const ctx = noteTranscript(note);
+    if (!ctx.segs.length) throw new Error('질문에 답할 전사 텍스트가 없습니다.');
+    const memoText = (note.memos || []).map(m => '[' + VN.util.fmtTime(m.time) + '] ' + m.text).join('\n');
+    const prompt = '아래는 음성 녹음의 전사 텍스트' + (memoText ? '와 사용자 메모' : '') + '입니다. ' +
+      '이 내용만을 근거로 질문에 한국어로 간결하게 답하세요. ' +
+      '내용에 없는 것은 추측하지 말고 "녹음 내용에서 찾을 수 없습니다"라고 답하세요. 마크다운 없이 일반 텍스트로.\n\n' +
+      '--- 전사 ---\n' + ctx.transcript +
+      (memoText ? '\n\n--- 메모 ---\n' + memoText : '') +
+      '\n\n--- 질문 ---\n' + question;
+    const genCfg = buildGenerationConfig(model, 0.3, 'speed');
+    delete genCfg.responseMimeType; // 일반 텍스트 응답
+    const body = JSON.stringify({
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: genCfg
+    });
+    const text = (await geminiGenerate(apiKey, model, body, onRetry)).trim();
+    if (!text) throw new Error('AI 응답이 비어 있습니다.');
+    return text;
   }
 
   /* ── 관용 JSON 배열 파서 (순수 함수 — 셀프테스트 커버) ──
@@ -438,9 +597,10 @@ VN.summarizer = (function () {
   }
 
   return {
-    run, runLocal, runGemini, transcribeAudioGemini, parseLenientJsonArray,
+    run, runLocal, runGemini, ask, transcribeAudioGemini, parseLenientJsonArray,
     summarize, splitTopics, extractTodos, keywords, tokenize,
     normalizeSummary, normalizeTodos, groupTodosByOwner,
+    normalizeMindmap, mindmapLayout,
     buildGenerationConfig,
     SUMMARY_MODELS, DEFAULT_MODEL, TRANSCRIBE_MODEL,
     QUALITY_MODES, DEFAULT_QUALITY, pickQuality
