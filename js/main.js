@@ -378,6 +378,65 @@ window.__vnDebug = {
       t('db.backupSensitiveKeys', false, String(e));
     }
 
+    // 19) 관용 JSON 배열 파서 (펜스·잘린 응답 salvage)
+    try {
+      const P = VN.summarizer.parseLenientJsonArray;
+      const full = P('[{"start":0,"speaker":"참석자1","text":"a"},{"start":5,"speaker":"참석자2","text":"b"}]');
+      const fenced = P('```json\n[{"start":0,"speaker":"s","text":"t"}]\n```');
+      const chatty = P('결과입니다: [{"start":1,"speaker":"s","text":"x"}]');
+      const truncated = P('[{"start":0,"speaker":"참석자1","text":"a"},{"start":5,"speaker":"참석자2","text":"b"},{"start":9,"spea');
+      const trailing = P('[{"start":0,"speaker":"s","text":"a"},');
+      const garbage = P('전사에 실패했습니다');
+      const notArray = P('{"start":0}');
+      t('summarizer.parseLenientJsonArray',
+        full && full.length === 2 && full[1].text === 'b' &&
+        fenced && fenced.length === 1 && fenced[0].text === 't' &&
+        chatty && chatty.length === 1 &&
+        truncated && truncated.length === 2 && truncated[1].speaker === '참석자2' &&
+        trailing && trailing.length === 1 &&
+        garbage === null && notArray === null,
+        'truncated→' + (truncated ? truncated.length : 'null') + '개 salvage');
+    } catch (e) { t('summarizer.parseLenientJsonArray', false, String(e)); }
+
+    // 20) 문장 단위 세그먼트 청커 (화자 전환·문장 종결·침묵 1.2초·140자 상한 분리)
+    try {
+      const M = VN.diarize._test.mergeWords;
+      const W = (word, start, end, speaker) => ({ punctuated_word: word, start, end, speaker });
+      const bySentence = M([W('안녕하세요.', 0, 1, 0), W('반갑습니다.', 1.1, 2, 0), W('네', 2.1, 2.5, 0)]);
+      const byGap = M([W('하나', 0, 1, 0), W('둘', 2.5, 3, 0)]);           // 1.5초 침묵 > 1.2초
+      const bySpeaker = M([W('하나', 0, 1, 0), W('둘', 1.1, 2, 1)]);
+      const merged = M([W('하나', 0, 1, 0), W('둘', 1.1, 2, 0)]);          // 분리 조건 없음 → 병합
+      const long = M(Array.from({ length: 60 }, (_, i) => W('열글자쯤되는단어입니다', i * 0.5, i * 0.5 + 0.4, 0)));
+      t('diarize.sentenceChunks',
+        bySentence.length === 3 && bySentence[0].text === '안녕하세요.' && bySentence[1].text === '반갑습니다.' &&
+        byGap.length === 2 && bySpeaker.length === 2 &&
+        merged.length === 1 && merged[0].text === '하나 둘' &&
+        long.length > 1 && long.every(s => s.text.length <= 140),
+        'sentence=' + bySentence.length + ' gap=' + byGap.length + ' long=' + long.length + '개(최대 ' +
+        Math.max.apply(null, long.map(s => s.text.length)) + '자)');
+    } catch (e) { t('diarize.sentenceChunks', false, String(e)); }
+
+    // 21) 자동 전사 관리자 — 엔진 체인 우선순위 + 결과 적용 매핑
+    try {
+      const T = VN.transcribe._test;
+      const c1 = T.chainFromKeys({ deepgram: true, assemblyai: true, gemini: true });
+      const c2 = T.chainFromKeys({ gemini: true });
+      const c3 = T.chainFromKeys({});
+      const dn = { segments: [], speakers: [] };
+      T.applyDiarizeSegments(dn, { segments: [{ start: 0, end: 2, speaker: 0, text: 'a' }, { start: 3, end: 5, speaker: 1, text: 'b' }] });
+      const gn = { segments: [], speakers: [] };
+      T.applyGeminiSegments(gn, [
+        { start: 0, speakerLabel: '참석자1', text: 'x' },
+        { start: 4, speakerLabel: '참석자2', text: 'y' }
+      ]);
+      t('transcribe.autoManager',
+        c1.join(',') === 'deepgram,assemblyai,gemini' && c2.join(',') === 'gemini' && c3.length === 0 &&
+        dn.segments.length === 2 && dn.speakers.length === 2 && dn.segments[1].speaker === 1 &&
+        gn.segments.length === 2 && gn.speakers[1].name === '참석자2' &&
+        gn.segments[0].end === 4 && gn.segments[1].end === 7,
+        'chain=' + c1.join('>'));
+    } catch (e) { t('transcribe.autoManager', false, String(e)); }
+
     // 18) 모바일 UA 감지 (Android/iOS + iPadOS 데스크톱 모드 포함, 데스크톱 제외)
     try {
       const f = VN.ui.isMobileUA;

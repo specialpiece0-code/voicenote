@@ -27,6 +27,9 @@ VN.recorder = (function () {
   let levelSamples = [];  // 노트 저장용 파형 피크
   let levelTimer = null;  // 레벨 샘플링은 rAF가 아니라 interval (탭 숨김 시 rAF 정지 대비)
 
+  // 수음 보강 체인의 출력 스트림 (teardown에서 트랙 정지)
+  let procStream = null;
+
   // 크래시 세이프 flush
   let persist = null;       // { getMeta() } — ui가 세그먼트·메모·북마크 스냅샷 제공
   let pendingChunks = [];   // 아직 IndexedDB에 저장 안 된 청크
@@ -117,9 +120,40 @@ VN.recorder = (function () {
     opts = opts || {};
     if (!supported) throw new Error('이 브라우저는 녹음(MediaRecorder)을 지원하지 않습니다.');
     if (state !== 'idle') throw new Error('이미 녹음 중입니다.');
-    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    // 에코 제거(같은 기기가 재생 중인 다른 앱 소리 상쇄) + 노이즈 억제 + 자동 게인
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    });
+    // 수음 보강: 컴프레서(+게인) 체인을 거친 스트림을 녹음해 작은 목소리를 키운다.
+    // 체인 구성이 실패하면 원본 마이크 스트림으로 폴백. 크래시 세이프 청크 로직은 동일.
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    try { audioCtx.resume(); } catch (e) { /* ignore */ }
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 2048;
+    let recStream = stream;
+    try {
+      const src = audioCtx.createMediaStreamSource(stream);
+      const comp = audioCtx.createDynamicsCompressor();
+      comp.threshold.value = -45;  // 작은 소리부터 압축 시작 → 다이내믹 레인지 축소
+      comp.knee.value = 30;
+      comp.ratio.value = 8;
+      comp.attack.value = 0.003;
+      comp.release.value = 0.25;
+      const gain = audioCtx.createGain();
+      gain.gain.value = 1.5;       // 압축으로 낮아진 평균 레벨 보상 + 증폭
+      const dest = audioCtx.createMediaStreamDestination();
+      src.connect(comp);
+      comp.connect(gain);
+      gain.connect(dest);
+      gain.connect(analyser);      // 파형·레벨 샘플링도 처리된 신호 기준
+      procStream = dest.stream;
+      recStream = procStream;
+    } catch (e) {
+      // 폴백: 원본 스트림 녹음 + 원본에서 파형만 추출
+      try { audioCtx.createMediaStreamSource(stream).connect(analyser); } catch (e2) { analyser = null; }
+    }
     mimeType = pickMime();
-    mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+    mediaRecorder = new MediaRecorder(recStream, mimeType ? { mimeType } : undefined);
     chunks = [];
     levelSamples = [];
     accumMs = 0;
@@ -139,11 +173,6 @@ VN.recorder = (function () {
       flushTimer = setInterval(flush, FLUSH_MS);
     }
 
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    const src = audioCtx.createMediaStreamSource(stream);
-    analyser = audioCtx.createAnalyser();
-    analyser.fftSize = 2048;
-    src.connect(analyser);
     levelTimer = setInterval(sampleLevel, 250);
 
     waveCanvas = opts.canvas || null;
@@ -177,6 +206,8 @@ VN.recorder = (function () {
     pendingChunks = [];
     if (audioCtx) { try { audioCtx.close(); } catch (e) { /* ignore */ } }
     audioCtx = null; analyser = null; waveCanvas = null;
+    if (procStream) { try { procStream.getTracks().forEach(t => t.stop()); } catch (e) { /* ignore */ } }
+    procStream = null;
     if (stream) { stream.getTracks().forEach(t => t.stop()); }
     stream = null;
     state = 'idle';

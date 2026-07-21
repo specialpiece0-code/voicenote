@@ -399,7 +399,8 @@ VN.ui = (function () {
         return;
       }
       list.innerHTML = results.map(({ note: n, snippet }) => {
-        const preview = q && snippet ? markText(snippet, q) : U.esc(noteText(n).slice(0, 120) || '(전사 없음)');
+        const preview = n.transcribePending ? '⏳ 텍스트 변환 중…'
+          : (q && snippet ? markText(snippet, q) : U.esc(noteText(n).slice(0, 120) || '(전사 없음)'));
         const fname = n.folderId ? (S.folders.find(f => f.id === n.folderId) || {}).name : null;
         return '<button class="note-card" data-id="' + n.id + '">' +
           '<div class="nc-title">' + (n.favorite ? '<span class="star">★</span>' : '') + markText(n.title || '제목 없음', q) + '</div>' +
@@ -460,7 +461,7 @@ VN.ui = (function () {
       '<button class="icon-btn" id="btn-export" title="다운로드">⬇</button>' +
       '<button class="icon-btn" id="btn-drive-save" title="Drive 저장">☁</button>' +
       '<button class="icon-btn" id="btn-cal" title="📅 일정 연결">📅</button>' +
-      (hasAudio ? '<button class="icon-btn" id="btn-regem" title="오디오 전체 재변환">🎤</button>' : '') +
+      (hasAudio ? '<button class="icon-btn" id="btn-regem" title="다시 변환(자동)">🎤</button>' : '') +
       '<button class="icon-btn" id="btn-del-note" title="삭제">🗑</button>' +
       '</div>' +
       '<div class="note-info">' +
@@ -537,7 +538,7 @@ VN.ui = (function () {
       } catch (e) { toast('Drive 저장 실패: ' + (e.message || e)); }
       b.disabled = false;
     };
-    if ($('#btn-regem')) $('#btn-regem').onclick = () => retranscribeModal(note);
+    if ($('#btn-regem')) $('#btn-regem').onclick = () => retranscribeAuto(note);
     /* 일정 연결 — 로그인/권한 없으면 조용히 버튼을 숨긴다 */
     $('#btn-cal').onclick = () => calendarLinkModal(note);
     VN.gcal.available().then(ok => {
@@ -690,7 +691,15 @@ VN.ui = (function () {
 
   function renderSegTab(note) {
     const body = $('#tab-body');
-    let html = '<div class="seg-toolbar">' +
+    let html = '';
+    // 자동 변환 인라인 상태 — 진행 모달 없이 여기서만 알린다
+    if (note.transcribePending) {
+      html += '<div class="banner info">⏳ 자동 텍스트 변환 중 — 화면을 이동해도 계속됩니다.</div>';
+    } else if (note.transcribeError) {
+      html += '<div class="banner">' + U.esc(note.transcribeError) +
+        ' <button class="btn btn-sm btn-primary" id="btn-tr-retry" style="margin-left:8px">다시 시도</button></div>';
+    }
+    html += '<div class="seg-toolbar">' +
       '<button class="filter-chip' + (S.segFilter === 'all' ? ' on' : '') + '" data-f="all">전체</button>' +
       '<button class="filter-chip' + (S.segFilter === 'bookmark' ? ' on' : '') + '" data-f="bookmark">🔖 북마크만</button>' +
       '<button class="filter-chip' + (S.segFilter === 'highlight' ? ' on' : '') + '" data-f="highlight">🖍 하이라이트만</button>' +
@@ -716,6 +725,11 @@ VN.ui = (function () {
     body.innerHTML = html;
 
     renderSegList(note);
+
+    if ($('#btn-tr-retry')) $('#btn-tr-retry').onclick = async () => {
+      const r = await VN.transcribe.start(note);
+      if (!r.started && r.reason === 'no-keys') go('#/settings');
+    };
 
     $$('.filter-chip[data-f]', body).forEach(c => c.onclick = () => { S.segFilter = c.dataset.f; renderSegTab(note); });
     $$('[data-bm-time]', body).forEach(c => c.onclick = () => { if (S.player) S.player.playFrom(+c.dataset.bmTime); });
@@ -1143,7 +1157,7 @@ VN.ui = (function () {
     // 모바일은 SpeechRecognition이 MediaRecorder와 마이크를 공유하지 못해(일부 기기는 녹음이 무음)
     // 실시간 자막을 끄고 녹음 종료 후 사후 전사를 안내한다.
     const mobile = isMobile();
-    const MOBILE_NOTICE = '모바일에서는 실시간 자막이 지원되지 않습니다. 녹음을 마치면 자동으로 텍스트 변환을 안내해 드립니다.';
+    const MOBILE_NOTICE = '모바일에서는 실시간 자막이 지원되지 않습니다. 녹음을 마치면 자동으로 텍스트 변환이 시작됩니다.';
     let html = '<div class="view record-wrap">';
     if (!recSupported) {
       html += '<div class="banner">이 브라우저는 녹음(MediaRecorder)을 지원하지 않습니다. Chrome 또는 Edge를 사용해 주세요.</div>';
@@ -1289,7 +1303,7 @@ VN.ui = (function () {
             VN.recorder.state === 'recording' && Date.now() - VN.stt.lastResultAt() > 15000) {
           S.rec.sttWarned = true;
           const warn = $('#rec-warn');
-          if (warn) warn.innerHTML = '<div class="banner">15초 이상 음성인식 결과가 없습니다. 녹음은 계속 저장되고 있으며, 종료 후 텍스트 변환을 안내해 드립니다.</div>';
+          if (warn) warn.innerHTML = '<div class="banner">15초 이상 음성인식 결과가 없습니다. 녹음은 계속 저장되고 있으며, 종료 후 자동으로 텍스트 변환이 시작됩니다.</div>';
         }
       }, 250);
     };
@@ -1456,20 +1470,19 @@ VN.ui = (function () {
     S.rec = null;
     // 녹음 중 보류해 둔 배포 감지 배너가 있으면 이제 표시
     if (deployPendingWhileRec) { deployPendingWhileRec = false; showDeployBanner(); }
+    // 전사 세그먼트가 없고 오디오가 충분히 길면(≈3초+) 묻지 않고 자동 텍스트 변환 시작
+    // (모바일은 실시간 자막이 없어 항상 이 경로를 탄다)
+    let transcribing = { started: false };
+    if (!note.segments.length && note.audioBlob instanceof Blob && (note.duration || 0) >= 3) {
+      transcribing = await VN.transcribe.start(note);
+    }
     if (!silent) {
       toast('노트가 생성되었습니다.');
       go('#/note/' + note.id);
-      // 전사 세그먼트가 없고 오디오가 충분히 길면(≈3초+) 바로 텍스트 변환 안내
-      // (모바일은 실시간 자막이 없어 항상 이 경로를 탄다)
-      if (!note.segments.length && note.audioBlob instanceof Blob && (note.duration || 0) >= 3) {
-        transcribeChoiceModal(note, {
-          intro: '"' + U.esc(note.title) + '" 녹음을 저장했습니다. 실시간 자막이 없어 음성 기록이 비어 있습니다. 어떻게 텍스트로 변환할까요?'
-        });
-      }
     }
-    // Drive 자동 저장은 화면 전환을 막지 않도록 백그라운드로 진행
-    // (주제 생성 → 파일명·노트 제목 확정 → 저장, 완료/실패는 토스트로 알림)
-    driveAutoSaveAfter(note);
+    // Drive 자동 저장: 변환을 시작했으면 완료·실패 후 1회(transcribe 리스너에서 실행 —
+    // 전사 없는 상태로 먼저 올라가 두 번 덮어쓰는 낭비 제거), 변환이 없으면 지금 백그라운드로.
+    if (!transcribing.started) driveAutoSaveAfter(note);
     return true;
   }
 
@@ -1512,7 +1525,7 @@ VN.ui = (function () {
   async function importFiles(files) {
     const audioFiles = [...files].filter(f => AUDIO_EXT.test(f.name) || (f.type || '').startsWith('audio/'));
     if (!audioFiles.length) { toast('지원하는 오디오 파일이 아닙니다. (mp3/m4a/aac/wav/webm/ogg)'); return; }
-    let lastNote = null;
+    const notes = [];
     for (const f of audioFiles) {
       toast('"' + f.name + '" 분석 중…');
       const info = await analyzeAudio(f);
@@ -1527,273 +1540,32 @@ VN.ui = (function () {
         language: await VN.db.getSetting('defaultLang', 'ko-KR')
       });
       await VN.db.saveNote(note);
-      lastNote = note;
+      notes.push(note);
     }
+    // 선택 모달 없이 자동으로 텍스트 변환 시작 (키가 없으면 노트에 안내가 남는다)
+    for (const n of notes) await VN.transcribe.start(n);
     await refresh();
     renderSidebar(location.hash);
-    if (audioFiles.length === 1 && lastNote) {
-      transcribeChoiceModal(lastNote);
+    if (notes.length === 1) {
+      go('#/note/' + notes[0].id);
     } else {
-      toast(audioFiles.length + '개 파일을 불러왔습니다.');
+      toast(notes.length + '개 파일을 불러왔습니다.');
       route();
     }
   }
 
-  /* ── 전사 방식 선택지 (업로드 직후 / 재변환 공통) ── */
-
-  const PROVIDER_LABEL = { deepgram: 'Deepgram', assemblyai: 'AssemblyAI' };
-
-  async function diarizeReady(provider) {
-    try { return !!(VN.diarize && await VN.diarize.isConfigured(provider)); }
-    catch (e) { return false; }
-  }
-
-  /* 사용 가능 여부를 미리 조회해 비활성 처리까지 마친 옵션 버튼 HTML */
-  async function transcribeOptionsHtml() {
-    const [gem, dg, aai] = await Promise.all([
-      VN.db.getSetting('geminiApiKey', ''),
-      diarizeReady('deepgram'),
-      diarizeReady('assemblyai')
-    ]);
-    const hint = '<div class="muted small" style="margin:-4px 0 8px">설정에서 키 입력이 필요합니다.</div>';
-    return {
-      gem: !!gem, dg, aai,
-      html:
-        '<button class="btn btn-primary btn-block" data-tc="gemini" style="margin-bottom:8px"' + (gem ? '' : ' disabled') + '>✨ Gemini AI 변환 (화자 추정)</button>' +
-        (gem ? '' : '<div class="muted small" style="margin:-4px 0 8px">Gemini API 키가 없습니다. 설정 → 고급 모드에서 키를 저장하세요.</div>') +
-        '<button class="btn btn-block" data-tc="deepgram" style="margin-bottom:8px"' + (dg ? '' : ' disabled') + '>🎙 Deepgram (자동 화자분리)</button>' +
-        (dg ? '' : hint) +
-        '<button class="btn btn-block" data-tc="assemblyai" style="margin-bottom:8px"' + (aai ? '' : ' disabled') + '>🎙 AssemblyAI (자동 화자분리)</button>' +
-        (aai ? '' : hint) +
-        '<button class="btn btn-block" data-tc="whisper" style="margin-bottom:8px">🤖 Whisper AI 변환 (인터넷 필요)</button>' +
-        '<button class="btn btn-block" data-tc="manual" style="margin-bottom:8px">✍️ 수동 전사 (구간을 추가하며 직접 입력)</button>'
-    };
-  }
-
-  async function transcribeChoiceModal(note, opts) {
-    const intro = (opts && opts.intro) ||
-      ('"' + U.esc(note.title) + '" 노트를 만들었습니다. 어떻게 텍스트로 변환할까요?');
-    const opt = await transcribeOptionsHtml();
-    const m = modal('<h2>텍스트 변환</h2><div class="modal-body">' +
-      '<p class="muted" style="margin-bottom:10px">' + intro + '</p>' +
-      opt.html +
-      '<button class="btn btn-ghost btn-block" data-tc="later">나중에 하기</button></div>');
-    $$('[data-tc]', m).forEach(b => b.onclick = async () => {
-      const kind = b.dataset.tc;
-      if (kind === 'gemini') { m.remove(); geminiTranscribeModal(note); return; }
-      if (kind === 'whisper') { m.remove(); whisperModal(note); return; }
-      if (kind === 'later') { m.remove(); go('#/note/' + note.id); return; }
-      if (kind === 'manual') {
-        m.remove(); go('#/note/' + note.id);
-        toast('음성 기록 탭의 "구간 추가"로 전사를 입력하세요.');
-        return;
-      }
-      // deepgram | assemblyai — 새 노트라 대체 확인은 생략
-      m.remove();
-      const ok = await diarizeTranscribe(note, kind, { confirm: false });
-      go('#/note/' + note.id);
-      if (ok) driveAutoSaveAfter(note); // 백그라운드 — 화면 전환을 막지 않는다
-    });
-  }
-
-  /* 노트 상세 🎤: 재변환 방식 선택 */
-  async function retranscribeModal(note) {
+  /* ── 노트 상세 🎤: 방식 선택 없이 자동 재변환.
+       이미 세그먼트가 있는 노트만 대체 확인을 거친다. ── */
+  async function retranscribeAuto(note) {
     if (!(note.audioBlob instanceof Blob)) { toast('오디오가 없는 노트입니다.'); return; }
-    const opt = await transcribeOptionsHtml();
-    const m = modal('<h2>오디오 전체 재변환</h2><div class="modal-body">' +
-      '<p class="muted small" style="margin-bottom:10px">오디오 전체를 다시 전사합니다. 기존 세그먼트 ' +
-      (note.segments || []).length + '개와 참석자 이름이 대체됩니다.</p>' + opt.html +
-      '</div><div class="modal-actions"><button class="btn" data-tc="cancel">취소</button></div>');
-    $$('[data-tc]', m).forEach(b => b.onclick = async () => {
-      const kind = b.dataset.tc;
-      m.remove();
-      if (kind === 'cancel') return;
-      if (kind === 'gemini') { geminiRetranscribe(note); return; }
-      if (kind === 'whisper') { whisperModal(note); return; }
-      if (kind === 'manual') { toast('음성 기록 탭의 "구간 추가"로 직접 입력하세요.'); return; }
-      const ok = await diarizeTranscribe(note, kind, { confirm: true });
-      if (ok) viewNote(note.id);
-    });
-  }
-
-  /* 화자 인덱스(0..N) → 참석자1..N 매핑 후 세그먼트 교체 — 순수 함수 */
-  function applyDiarizeSegments(note, result) {
-    const segs = (result && Array.isArray(result.segments)) ? result.segments : [];
-    let maxSp = 0;
-    for (const s of segs) maxSp = Math.max(maxSp, Math.max(0, s.speaker | 0));
-    const speakers = [];
-    for (let i = 0; i <= maxSp; i++) speakers.push({ name: '참석자 ' + (i + 1) });
-    note.speakers = speakers;
-    note.segments = segs.map(s => {
-      const start = Number(s.start) || 0;
-      const end = Number(s.end);
-      return {
-        id: U.uid(),
-        speaker: Math.max(0, s.speaker | 0),
-        start,
-        end: (isFinite(end) && end > start) ? end : start + 3,
-        text: String(s.text || ''),
-        bookmarked: false, highlighted: false
-      };
-    });
-  }
-
-  /* VN.diarize 호출 + 진행률 표시. 성공하면 true */
-  async function diarizeTranscribe(note, provider, opts) {
-    opts = opts || {};
-    const label = PROVIDER_LABEL[provider] || provider;
-    if (!(note.audioBlob instanceof Blob)) { toast('오디오가 없는 노트입니다.'); return false; }
-    if (!(await diarizeReady(provider))) {
-      toast(label + ' 키가 없습니다. 설정에서 키를 입력하세요.');
-      return false;
+    if (VN.transcribe.isActive(note.id)) { toast('이미 텍스트 변환이 진행 중입니다.'); return; }
+    if ((note.segments || []).length) {
+      const ok = await confirmModal('다시 변환(자동)',
+        '오디오 전체를 다시 텍스트로 변환합니다.<br>기존 세그먼트 ' +
+        note.segments.length + '개와 참석자 이름이 <b>대체</b>됩니다.', '다시 변환', true);
+      if (!ok) return;
     }
-    if (opts.confirm) {
-      const ok = await confirmModal('자동 화자분리 재변환 (' + label + ')',
-        '오디오 전체를 다시 전사하고 화자를 자동으로 나눕니다.<br>기존 세그먼트 ' +
-        (note.segments || []).length + '개와 참석자 이름이 <b>대체</b>됩니다.', '재변환', true);
-      if (!ok) return false;
-    }
-    const m = modal('<h2>' + U.esc(label) + ' 변환</h2><div class="modal-body">' +
-      '<div id="dz-status" class="muted small">변환 중…</div>' +
-      '<div class="progress-outer"><div class="progress-inner" id="dz-prog"></div></div></div>');
-    try {
-      const r = await VN.diarize.transcribe(note.audioBlob, {
-        provider,
-        language: note.language,
-        onProgress: (a, b) => {
-          // VN.diarize는 0~1 비율로 알린다. 0~100 형태도 함께 허용.
-          let val = 0, msg = '';
-          if (typeof a === 'number') { val = a; msg = b || ''; }
-          else if (a && typeof a === 'object') { val = Number(a.pct || a.percent || a.progress || 0); msg = a.message || a.msg || ''; }
-          if (!isFinite(val) || val < 0) val = 0;
-          const pct = val <= 1 ? val * 100 : val;
-          const p = $('#dz-prog', m), st = $('#dz-status', m);
-          if (p) p.style.width = Math.min(100, pct) + '%';
-          if (st && msg) st.textContent = msg;
-        }
-      });
-      applyDiarizeSegments(note, r);
-      await saveNote(note);
-      m.remove();
-      const cnt = (r && Array.isArray(r.segments)) ? r.segments.length : 0;
-      toast(cnt + '개 구간 · 화자 ' + (note.speakers || []).length + '명으로 변환했습니다.');
-      return true;
-    } catch (e) {
-      m.remove();
-      toast(label + ' 변환 실패: ' + ((e && e.message) || e));
-      return false;
-    }
-  }
-
-  function whisperModal(note) {
-    const m = modal('<h2>Whisper AI 변환</h2><div class="modal-body">' +
-      '<p class="muted small" style="margin-bottom:10px">브라우저에서 Whisper 모델을 내려받아 기기 내에서 변환합니다. 최초 1회 모델 다운로드(수십 MB)가 필요하며 시간이 걸릴 수 있습니다.</p>' +
-      '<div class="form-row"><label>모델</label><select id="wh-model">' +
-      '<option value="tiny">tiny (빠름, 정확도 낮음)</option>' +
-      '<option value="base">base (느림, 정확도 높음)</option></select></div>' +
-      '<div class="form-row"><label>언어</label><select id="wh-lang">' +
-      '<option value="ko-KR">한국어</option><option value="en-US">영어</option>' +
-      '<option value="ja-JP">일본어</option><option value="zh-CN">중국어</option></select></div>' +
-      '<div id="wh-status" class="muted small"></div>' +
-      '<div class="progress-outer"><div class="progress-inner" id="wh-prog"></div></div>' +
-      '</div><div class="modal-actions"><button class="btn" data-x="no">닫기</button>' +
-      '<button class="btn btn-primary" id="wh-go">변환 시작</button></div>');
-    $('#wh-lang', m).value = note.language || 'ko-KR';
-    $('[data-x="no"]', m).onclick = () => { m.remove(); go('#/note/' + note.id); };
-    $('#wh-go', m).onclick = async () => {
-      const btn = $('#wh-go', m);
-      btn.disabled = true;
-      try {
-        const segs = await VN.whisper.transcribe(note.audioBlob, {
-          model: $('#wh-model', m).value,
-          language: $('#wh-lang', m).value,
-          onProgress: (pct, msg) => {
-            const p = $('#wh-prog', m), st = $('#wh-status', m);
-            if (p) p.style.width = pct + '%';
-            if (st) st.textContent = msg || '';
-          }
-        });
-        note.segments = segs.map(s => ({
-          id: U.uid(), speaker: 0, start: s.start, end: s.end, text: s.text,
-          bookmarked: false, highlighted: false
-        }));
-        note.language = $('#wh-lang', m).value;
-        await saveNote(note);
-        toast(segs.length + '개 구간을 변환했습니다.');
-        m.remove();
-        go('#/note/' + note.id);
-        driveAutoSaveAfter(note); // 백그라운드
-      } catch (e) {
-        const st = $('#wh-status', m);
-        if (st) st.innerHTML = '<span style="color:var(--danger)">' + U.esc(e.message || String(e)) + '</span>';
-        btn.disabled = false;
-      }
-    };
-  }
-
-  /* ══════════════ Gemini 오디오 전사 ══════════════ */
-
-  /* Gemini 전사 결과 → 노트 세그먼트·참석자 적용 (기존 세그먼트 대체) */
-  function applyGeminiSegments(note, items) {
-    const labels = [];
-    for (const it of items) if (!labels.includes(it.speakerLabel)) labels.push(it.speakerLabel);
-    if (!labels.length) labels.push('참석자 1');
-    note.speakers = labels.map(l => ({ name: l }));
-    note.segments = items.map((it, i) => ({
-      id: U.uid(),
-      speaker: Math.max(0, labels.indexOf(it.speakerLabel)),
-      start: it.start,
-      end: items[i + 1] ? Math.max(it.start, items[i + 1].start) : it.start + 3,
-      text: it.text,
-      bookmarked: false, highlighted: false
-    }));
-  }
-
-  /* 업로드 변환 모달의 Gemini 경로 */
-  function geminiTranscribeModal(note) {
-    const m = modal('<h2>Gemini AI 변환</h2><div class="modal-body">' +
-      '<p class="muted small" style="margin-bottom:10px">오디오 전체를 Gemini 3.5 Flash에 보내 화자 추정과 함께 전사합니다. (오디오 18MB 이하, 인터넷 필요)</p>' +
-      '<div id="gm-status" class="muted small">준비됨</div>' +
-      '</div><div class="modal-actions"><button class="btn" data-x="no">닫기</button>' +
-      '<button class="btn btn-primary" id="gm-go">변환 시작</button></div>');
-    $('[data-x="no"]', m).onclick = () => { m.remove(); go('#/note/' + note.id); };
-    $('#gm-go', m).onclick = async () => {
-      const btn = $('#gm-go', m);
-      btn.disabled = true;
-      $('#gm-status', m).textContent = '변환 중… (오디오 길이에 따라 수십 초 걸릴 수 있습니다)';
-      try {
-        const items = await VN.summarizer.transcribeAudioGemini(note.audioBlob, { language: note.language });
-        applyGeminiSegments(note, items);
-        await saveNote(note);
-        toast(items.length + '개 발화를 변환했습니다.');
-        m.remove();
-        go('#/note/' + note.id);
-        driveAutoSaveAfter(note); // 백그라운드
-      } catch (e) {
-        const st = $('#gm-status', m);
-        if (st) st.innerHTML = '<span style="color:var(--danger)">' + U.esc(e.message || String(e)) + '</span>';
-        btn.disabled = false;
-      }
-    };
-  }
-
-  /* 노트 상세: 오디오 전체 재변환 (기존 세그먼트 대체 전 확인) */
-  async function geminiRetranscribe(note) {
-    const key = await VN.db.getSetting('geminiApiKey', '');
-    if (!key) { toast('Gemini API 키가 없습니다. 설정 → 고급 모드에서 저장하세요.'); return; }
-    if (!(note.audioBlob instanceof Blob)) { toast('오디오가 없는 노트입니다.'); return; }
-    const n = (note.segments || []).length;
-    const ok = await confirmModal('오디오 전체 재변환 (Gemini)',
-      '오디오 전체를 Gemini로 다시 전사합니다.<br>기존 세그먼트 ' + n + '개와 참석자 이름이 <b>대체</b>됩니다.', '재변환', true);
-    if (!ok) return;
-    toast('Gemini 재변환 중… (수십 초 걸릴 수 있습니다)');
-    try {
-      const items = await VN.summarizer.transcribeAudioGemini(note.audioBlob, { language: note.language });
-      applyGeminiSegments(note, items);
-      await saveNote(note);
-      toast(items.length + '개 발화로 재변환했습니다.');
-      viewNote(note.id);
-    } catch (e) { toast('재변환 실패: ' + (e.message || e)); }
+    await VN.transcribe.start(note);
   }
 
   /* ══════════════ 캘린더 일정 연결 ══════════════ */
@@ -1967,7 +1739,7 @@ VN.ui = (function () {
       (val ? '<button class="btn btn-sm" data-keydel="' + id + '">삭제</button>' : '') + '</div>';
 
     html += '<div class="settings-group"><h2>자동 화자분리 (Deepgram / AssemblyAI)</h2>' +
-      '<p class="muted small" style="margin-bottom:8px">키를 저장하면 업로드 변환·오디오 전체 재변환에서 화자를 자동으로 나눠 전사할 수 있습니다. 키는 이 브라우저(IndexedDB)에만 저장됩니다.</p>' +
+      '<p class="muted small" style="margin-bottom:8px">자동 텍스트 변환은 Deepgram(우선) → AssemblyAI(예비) → Gemini 순으로 저장된 키를 사용합니다. Deepgram 키가 있으면 화자까지 자동으로 나눠 전사합니다. 키는 이 브라우저(IndexedDB)에만 저장됩니다.</p>' +
       keyRow('st-dg-key', 'Deepgram API 키', dgKey, '키 입력') +
       keyRow('st-aai-key', 'AssemblyAI API 키', aaiKey, '키 입력') + '</div>';
 
@@ -2066,7 +1838,7 @@ VN.ui = (function () {
     html += '<div class="settings-group"><h2>도움말</h2><div class="muted small" style="line-height:1.8">' +
       '· 마이크 녹음과 실시간 음성인식은 Chrome/Edge + localhost(또는 HTTPS)에서만 동작합니다.<br>' +
       '· 실시간 음성인식(SpeechRecognition)은 브라우저가 제공하는 온라인 서비스라 인터넷 연결이 필요합니다.<br>' +
-      '· Firefox는 음성인식을 지원하지 않아 녹음만 가능합니다. 이후 Whisper AI 변환을 사용하세요.<br>' +
+      '· Firefox는 음성인식을 지원하지 않아 녹음만 가능합니다. 녹음을 마치면 자동 텍스트 변환이 시작됩니다.<br>' +
       '· 모든 데이터는 이 브라우저(IndexedDB)에만 저장됩니다. 브라우저 데이터 삭제 시 함께 삭제되니 주기적으로 백업하세요.</div></div>';
 
     html += '</div>';
@@ -2294,9 +2066,10 @@ VN.ui = (function () {
       if (e.dataTransfer.files.length) importFiles(e.dataTransfer.files);
     });
 
-    // 녹음 중 새로고침·닫기 확인
+    // 녹음 중·텍스트 변환 중 새로고침·닫기 확인
+    // (변환 중 탭을 닫으면 진행 중 요청은 끊기지만, 다음 실행 때 자동으로 이어서 처리된다)
     window.addEventListener('beforeunload', (e) => {
-      if (S.rec && S.rec.active) { e.preventDefault(); e.returnValue = ''; }
+      if ((S.rec && S.rec.active) || VN.transcribe.activeCount() > 0) { e.preventDefault(); e.returnValue = ''; }
     });
 
     // 탭 복귀: Wake Lock 재획득 + 백그라운드 STT 중단 감지.
@@ -2308,9 +2081,24 @@ VN.ui = (function () {
       if (S.rec.sttOn && !S.rec.sttWarned && Date.now() - VN.stt.lastResultAt() > 60000) {
         S.rec.sttWarned = true;
         const warn = $('#rec-warn');
-        if (warn) warn.innerHTML = '<div class="banner">백그라운드 동안 음성인식이 일부 중단됐을 수 있습니다. 녹음은 계속 저장되고 있으니, 저장 후 노트에서 "오디오 전체 재변환(Gemini)"으로 전체를 다시 전사할 수 있습니다.</div>';
+        if (warn) warn.innerHTML = '<div class="banner">백그라운드 동안 음성인식이 일부 중단됐을 수 있습니다. 녹음은 계속 저장되고 있으니, 저장 후 노트의 🎤 "다시 변환(자동)"으로 전체를 다시 전사할 수 있습니다.</div>';
       }
     });
+
+    // 자동 전사 진행 알림: 완료 토스트 + 보고 있는 화면 갱신 + Drive 자동 저장(변환 완료 후 1회)
+    VN.transcribe.setListener(async (note, phase) => {
+      if (phase === 'done') toast('"' + note.title + '" 텍스트 변환 완료 (' + (note.segments || []).length + '개 구간)');
+      else if (phase === 'error' || phase === 'blocked') toast(note.transcribeError || '텍스트 변환에 실패했습니다.', 5000);
+      const hash = location.hash || '#/list';
+      if (S.note && S.note.id === note.id && hash.startsWith('#/note/')) await viewNote(note.id);
+      else if (hash === '' || hash === '#' || hash.startsWith('#/list') || hash.startsWith('#/fav') || hash.startsWith('#/folder')) await route();
+      // Drive 자동 저장은 변환이 끝난 뒤 1회 — 실패해도 오디오·메모는 저장되게 error에서도 실행
+      if (phase === 'done' || phase === 'error') driveAutoSaveAfter(note);
+    });
+    // 지난 세션에서 끊긴 변환(pending 노트) 자동 재개 — "창을 닫아도 됨"의 웹 구현
+    VN.transcribe.resumePending().then(n => {
+      if (n) toast('진행 중이던 텍스트 변환 ' + n + '건을 재개했습니다.');
+    }).catch(() => { /* ignore */ });
 
     // 크래시 복구·Drive 권한 배너·웹훅 재시도 큐·배포 감지
     checkRecovery();

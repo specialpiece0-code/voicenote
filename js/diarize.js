@@ -14,7 +14,9 @@ VN.diarize = (function () {
     assemblyai: 'assemblyaiApiKey'
   };
 
-  const GAP_SPLIT_SEC = 2;          // 같은 화자라도 이 간격을 넘으면 세그먼트 분리
+  const GAP_SPLIT_SEC = 1.2;        // 같은 화자라도 이 침묵 간격을 넘으면 세그먼트 분리
+  const MAX_SEG_CHARS = 140;        // 세그먼트 최대 길이 — 가독성 상한
+  const SENTENCE_END_RE = /[.?!…。？！]["')\]]?$/; // smart_format 문장 종결 부호
   const BIG_UPLOAD_BYTES = 100 * 1024 * 1024;
   const DEEPGRAM_TIMEOUT_MS = 10 * 60 * 1000;
   const AAI_STEP_TIMEOUT_MS = 2 * 60 * 1000;
@@ -31,13 +33,16 @@ VN.diarize = (function () {
   }
 
   /* Deepgram words[] → 세그먼트 배열.
-     같은 speaker 연속 구간을 병합하되, 단어 사이 간격이 2초를 넘으면 분리한다.
+     가독성을 위해 일정한 규칙으로 끊는다:
+     ① 화자 전환 시 항상 분리 ② 문장 종결 부호(. ? ! 등) 뒤에서 분리
+     ③ 침묵 간격 1.2초 초과 시 분리 ④ 세그먼트 140자 상한.
      speaker 값은 여기서는 원본 그대로 두고 normalizeSpeakers가 재매핑한다. */
   function mergeWords(words) {
     const segs = [];
     if (!Array.isArray(words)) return segs;
     let cur = null;
     let prevEnd = null;
+    let prevSentenceEnd = false;
 
     for (const w of words) {
       if (!w) continue;
@@ -49,8 +54,9 @@ VN.diarize = (function () {
 
       const sameSpeaker = cur && cur.speaker === speaker;
       const gapOk = prevEnd == null || (start - prevEnd) <= GAP_SPLIT_SEC;
+      const lenOk = cur && (cur.text.length + 1 + String(text).length) <= MAX_SEG_CHARS;
 
-      if (sameSpeaker && gapOk) {
+      if (sameSpeaker && gapOk && !prevSentenceEnd && lenOk) {
         cur.text += ' ' + text;
         cur.end = end;
       } else {
@@ -58,6 +64,7 @@ VN.diarize = (function () {
         segs.push(cur);
       }
       prevEnd = end;
+      prevSentenceEnd = SENTENCE_END_RE.test(String(text));
     }
     return segs;
   }

@@ -313,25 +313,60 @@ VN.summarizer = (function () {
     return normalizeSummary(Object.assign({ mode: 'gemini', model: model }, parsed));
   }
 
+  /* ── 관용 JSON 배열 파서 (순수 함수 — 셀프테스트 커버) ──
+     ① 펜스(```json)·앞쪽 잡담 제거 후 엄격 파싱 시도
+     ② 실패하면(MAX_TOKENS로 잘린 응답 등) 마지막 완전한 '}'까지 자르고 ']'를 닫아
+        재파싱 — 부분 결과라도 살린다. 실패 시 null. */
+  function parseLenientJsonArray(raw) {
+    let text = String(raw == null ? '' : raw).trim()
+      .replace(/^```(json)?/i, '').replace(/```$/, '').trim();
+    const jsonStart = text.indexOf('[');
+    if (jsonStart > 0) text = text.slice(jsonStart);
+    try {
+      const a = JSON.parse(text);
+      return Array.isArray(a) ? a : null;
+    } catch (e) { /* 잘린 JSON — 아래 salvage 시도 */ }
+    const lastObj = text.lastIndexOf('}');
+    if (lastObj === -1) return null;
+    try {
+      const a = JSON.parse(text.slice(0, lastObj + 1) + ']');
+      return Array.isArray(a) ? a : null;
+    } catch (e) { return null; }
+  }
+
   /* ── Gemini 오디오 전사: Blob(≤18MB)을 inlineData로 보내 화자 라벨 세그먼트 획득
-       (오디오 전사는 비용이 커서 요약 모델 선택과 무관하게 TRANSCRIBE_MODEL 고정) ── */
+       (오디오 전사는 비용이 커서 요약 모델 선택과 무관하게 TRANSCRIBE_MODEL 고정)
+     13분 이상 오디오의 전사 JSON은 기본 출력 한도를 초과해 잘리므로 maxOutputTokens를
+     모델 한도(65536)로 크게 잡고, 모델이 거부하면 안전값으로 낮춰 다시 보낸다.
+     응답이 잘리면 관용 파서로 부분 결과를 살리고, 5xx/429/타임아웃/파싱 실패는 1회 재시도. */
+  const TRANSCRIBE_MAX_TOKENS = 65536;
+  const TRANSCRIBE_MAX_TOKENS_SAFE = 32768;
+
   async function transcribeAudioGemini(blob, opts) {
     opts = opts || {};
     const apiKey = await VN.db.getSetting('geminiApiKey', '');
     if (!apiKey) throw new Error('Gemini API 키가 설정되지 않았습니다. (설정 → 고급 모드)');
     if (!(blob instanceof Blob)) throw new Error('오디오가 없습니다.');
     if (blob.size * 4 / 3 > 18 * 1024 * 1024) {
-      throw new Error('오디오가 18MB를 초과하여 Gemini 변환을 사용할 수 없습니다. (분할 미지원 — Whisper 변환을 사용하세요)');
+      throw new Error('오디오가 18MB를 초과하여 Gemini 변환을 사용할 수 없습니다. (설정에 Deepgram 키를 등록하면 큰 파일도 자동 변환됩니다)');
     }
     const b64 = await VN.util.blobToBase64(blob);
     const langLabel = { 'ko-KR': '한국어', 'en-US': '영어', 'ja-JP': '일본어', 'zh-CN': '중국어' }[opts.language] || '들리는 언어';
     const prompt = '첨부된 오디오 전체를 ' + langLabel + '로 전사하세요. ' +
       '각 발화를 {"start": 발화 시작 시각(초, number), "speaker": "참석자1"|"참석자2"|… (목소리로 화자 추정), "text": "발화 내용"} ' +
-      '객체로 하는 JSON 배열만 출력하세요. 다른 텍스트 금지. 무음 구간은 건너뛰세요.';
-    const resp = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + TRANSCRIBE_MODEL + ':generateContent', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-      body: JSON.stringify({
+      '객체로 하는 JSON 배열만 출력하세요. 다른 텍스트 금지. 무음 구간은 건너뛰세요. ' +
+      'text는 문장 단위로 끊어 한 객체에 한두 문장만 담으세요.';
+    const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + TRANSCRIBE_MODEL + ':generateContent';
+    const headers = { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey };
+    const ATTEMPT_TIMEOUT = 45000; // 응답이 없어도 영원히 기다리지 않는다
+    const MAX_ATTEMPTS = 2;        // 1회 재시도
+    let maxTokens = TRANSCRIBE_MAX_TOKENS;
+    let lastMsg = '';
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      if (attempt > 0) await new Promise(r => setTimeout(r, 3000));
+      const genCfg = buildGenerationConfig(TRANSCRIBE_MODEL, 0.2, 'speed');
+      genCfg.maxOutputTokens = maxTokens;
+      const body = JSON.stringify({
         contents: [{
           role: 'user',
           parts: [
@@ -339,29 +374,49 @@ VN.summarizer = (function () {
             { inlineData: { mimeType: blob.type || 'audio/webm', data: b64 } }
           ]
         }],
-        generationConfig: buildGenerationConfig(TRANSCRIBE_MODEL, 0.2, 'speed')
-      })
-    });
-    if (!resp.ok) {
-      let msg = 'Gemini API 오류 (' + resp.status + ')';
-      try { const j = await resp.json(); if (j.error && j.error.message) msg += ': ' + j.error.message; } catch (e) { /* ignore */ }
-      throw new Error(msg);
+        generationConfig: genCfg
+      });
+      const ctrl = new AbortController();
+      let timedOut = false;
+      const timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, ATTEMPT_TIMEOUT);
+      let resp = null;
+      try {
+        resp = await fetch(url, { method: 'POST', headers: headers, body: body, signal: ctrl.signal });
+      } catch (e) {
+        lastMsg = timedOut ? 'Gemini 응답이 45초 안에 오지 않았습니다.' : '네트워크 오류: ' + ((e && e.message) || e);
+      } finally { clearTimeout(timer); }
+      if (!resp) continue;
+      if (!resp.ok) {
+        lastMsg = 'Gemini API 오류 (' + resp.status + ')';
+        let errText = '';
+        try { const j = await resp.json(); if (j.error && j.error.message) { errText = j.error.message; lastMsg += ': ' + errText; } } catch (e) { /* ignore */ }
+        // 모델이 maxOutputTokens 값을 거부하면 안전값으로 낮춰 즉시 다시 보낸다 (재시도 횟수 미차감)
+        if (resp.status === 400 && /max_?output_?tokens/i.test(errText) && maxTokens > TRANSCRIBE_MAX_TOKENS_SAFE) {
+          maxTokens = TRANSCRIBE_MAX_TOKENS_SAFE;
+          attempt--;
+          continue;
+        }
+        if (resp.status === 429 || resp.status >= 500) continue;
+        throw new Error(lastMsg);
+      }
+      const data = await resp.json();
+      const cand = (data.candidates && data.candidates[0]) || null;
+      const text = (cand && cand.content && cand.content.parts && cand.content.parts[0] &&
+        cand.content.parts[0].text) || '';
+      const arr = parseLenientJsonArray(text);
+      if (!arr || !arr.length) {
+        lastMsg = (cand && cand.finishReason === 'MAX_TOKENS')
+          ? '전사 결과가 출력 한도(MAX_TOKENS)를 넘겨 잘렸고 복구 가능한 부분이 없습니다. 오디오를 나눠 다시 시도해 주세요.'
+          : 'Gemini 전사 응답을 해석하지 못했습니다.';
+        continue;
+      }
+      return arr.map(x => ({
+        start: Math.max(0, Number(x.start) || 0),
+        speakerLabel: String(x.speaker || '참석자1').trim() || '참석자1',
+        text: String(x.text || '').trim()
+      })).filter(x => x.text);
     }
-    const data = await resp.json();
-    let text = (data.candidates && data.candidates[0] && data.candidates[0].content &&
-      data.candidates[0].content.parts && data.candidates[0].content.parts[0] &&
-      data.candidates[0].content.parts[0].text) || '';
-    text = text.trim().replace(/^```(json)?/i, '').replace(/```$/, '').trim();
-    const jsonStart = text.indexOf('[');
-    if (jsonStart > 0) text = text.slice(jsonStart);
-    let arr;
-    try { arr = JSON.parse(text); } catch (e) { throw new Error('Gemini 전사 응답을 해석하지 못했습니다.'); }
-    if (!Array.isArray(arr)) throw new Error('Gemini 전사 응답 형식이 올바르지 않습니다.');
-    return arr.map(x => ({
-      start: Math.max(0, Number(x.start) || 0),
-      speakerLabel: String(x.speaker || '참석자1').trim() || '참석자1',
-      text: String(x.text || '').trim()
-    })).filter(x => x.text);
+    throw new Error(lastMsg || 'Gemini 전사에 실패했습니다.');
   }
 
   /* ── 진입점: API 키가 있으면 Gemini, 실패 시 로컬 폴백.
@@ -383,7 +438,7 @@ VN.summarizer = (function () {
   }
 
   return {
-    run, runLocal, runGemini, transcribeAudioGemini,
+    run, runLocal, runGemini, transcribeAudioGemini, parseLenientJsonArray,
     summarize, splitTopics, extractTodos, keywords, tokenize,
     normalizeSummary, normalizeTodos, groupTodosByOwner,
     buildGenerationConfig,
