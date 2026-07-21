@@ -281,17 +281,16 @@ VN.ui = (function () {
       const ok = await finishRecording(true);
       if (ok) toast('진행 중이던 녹음을 저장했습니다.');
     }
-    $('#app').classList.remove('sidebar-open');
-
     const hash = location.hash || '#/list';
     const parts = hash.slice(2).split('/');
     await refresh();
-    renderSidebar(hash);
+    updateNav(hash);
 
     if (parts[0] === 'note' && parts[1]) await viewNote(parts[1]);
     else if (parts[0] === 'record') viewRecord();
     else if (parts[0] === 'settings') await viewSettings();
     else if (parts[0] === 'trash') await viewTrash();
+    else if (parts[0] === 'search') viewSearch();
     else if (parts[0] === 'folder' && parts[1]) viewList({ folderId: parts[1] });
     else if (parts[0] === 'fav') viewList({ favorite: true });
     else viewList({});
@@ -302,49 +301,80 @@ VN.ui = (function () {
     else location.hash = hash;
   }
 
-  /* ══════════════ 사이드바 ══════════════ */
+  /* ══════════════ 하단 내비게이션 ══════════════ */
 
-  function renderSidebar(hash) {
-    const nav = $('#sidebar-nav');
-    const counts = { all: S.notes.length, fav: S.notes.filter(n => n.favorite).length };
-    const folderCount = (id) => S.notes.filter(n => n.folderId === id).length;
-    let html = '';
-    const item = (h, icon, label, count) =>
-      '<button class="nav-item' + (hash === h || (h === '#/list' && (hash === '' || hash === '#' || hash === '#/list')) ? ' active' : '') +
-      '" data-go="' + h + '">' + icon + ' ' + U.esc(label) +
-      (count != null ? '<span class="count">' + count + '</span>' : '') + '</button>';
-    html += item('#/list', '📄', '전체 노트', counts.all);
-    html += item('#/fav', '⭐', '즐겨찾기', counts.fav);
-    html += '<div class="nav-section"><span>폴더</span><button id="btn-add-folder" title="새 폴더">＋</button></div>';
-    for (const f of S.folders) {
-      html += item('#/folder/' + f.id, '📁', f.name, folderCount(f.id));
-    }
-    html += '<div class="nav-section"><span>관리</span></div>';
-    html += item('#/trash', '🗑️', '휴지통');
-    html += item('#/settings', '⚙️', '설정');
-    nav.innerHTML = html;
-    $$('.nav-item', nav).forEach(b => b.onclick = () => go(b.dataset.go));
-    $('#btn-add-folder').onclick = async () => {
-      const name = await promptModal('새 폴더', '폴더 이름', '');
-      if (!name) return;
-      await VN.db.saveFolder({ name });
-      await refresh(); renderSidebar(location.hash);
-      toast('폴더를 만들었습니다.');
-    };
-    updateStorageInfo();
+  function updateNav(hash) {
+    hash = hash || location.hash || '#/list';
+    const s = $('#nav-search'), st = $('#nav-settings'), r = $('#nav-record');
+    if (s) s.classList.toggle('active', hash.startsWith('#/search'));
+    if (st) st.classList.toggle('active', hash.startsWith('#/settings'));
+    if (r) r.classList.toggle('recording', !!(S.rec && S.rec.active));
   }
 
-  async function updateStorageInfo() {
-    const el = $('#storage-info');
-    if (!el) return;
-    if (navigator.storage && navigator.storage.estimate) {
-      try {
-        const est = await navigator.storage.estimate();
-        const used = (est.usage / 1024 / 1024).toFixed(1);
-        const quota = (est.quota / 1024 / 1024 / 1024).toFixed(1);
-        el.textContent = '저장 용량 ' + used + 'MB / ' + quota + 'GB';
-      } catch (e) { el.textContent = ''; }
+  /* ── 앵커 아래 드롭다운 메뉴 (홈·노트 ⋯ 공용) ──
+     items: {icon,label,onClick,danger,checked} | {sep:true} | {head:'제목'} */
+  function menuPop(anchor, items) {
+    const back = document.createElement('div');
+    back.className = 'menu-backdrop';
+    const pop = document.createElement('div');
+    pop.className = 'menu-pop';
+    pop.setAttribute('role', 'menu');
+    for (const it of items) {
+      if (it.sep) { const hr = document.createElement('div'); hr.className = 'menu-sep'; pop.appendChild(hr); continue; }
+      if (it.head) { const hd = document.createElement('div'); hd.className = 'menu-head'; hd.textContent = it.head; pop.appendChild(hd); continue; }
+      const b = document.createElement('button');
+      b.setAttribute('role', 'menuitem');
+      b.innerHTML = '<span class="mi-icon">' + (it.icon || '') + '</span>' + U.esc(it.label) +
+        (it.checked ? '<span class="mi-check">✓</span>' : '');
+      if (it.danger) b.classList.add('danger');
+      b.onclick = () => { back.remove(); if (it.onClick) it.onClick(); };
+      pop.appendChild(b);
     }
+    back.addEventListener('click', (e) => { if (e.target === back) back.remove(); });
+    back.appendChild(pop);
+    document.body.appendChild(back);
+    const r = anchor.getBoundingClientRect();
+    pop.style.top = Math.round(r.bottom + 6) + 'px';
+    pop.style.right = Math.max(8, Math.round(window.innerWidth - r.right)) + 'px';
+    requestAnimationFrame(() => {   // 화면 아래로 넘치면 위로 밀어 올린다
+      const pr = pop.getBoundingClientRect();
+      if (pr.bottom > window.innerHeight - 8) pop.style.top = Math.max(8, window.innerHeight - pr.height - 8) + 'px';
+    });
+    return back;
+  }
+
+  /* ── 폴더 생성·관리 (홈 필터 칩에서 진입) ── */
+  async function addFolderFlow() {
+    const name = await promptModal('새 폴더', '폴더 이름', '');
+    if (!name) return;
+    await VN.db.saveFolder({ name });
+    toast('폴더를 만들었습니다.');
+    route();
+  }
+
+  function folderManageModal(folder) {
+    if (!folder) return;
+    const m = modal('<h2>📁 ' + U.esc(folder.name) + '</h2><div class="modal-body">' +
+      '<button class="btn btn-block" id="fo-ren" style="margin-bottom:8px">✏️ 이름 변경</button>' +
+      '<button class="btn btn-block btn-danger" id="fo-del">🗑 폴더 삭제</button>' +
+      '<p class="muted small" style="margin-top:10px">폴더를 삭제하면 안의 노트는 전체 노트로 이동합니다.</p></div>' +
+      '<div class="modal-actions"><button class="btn" data-x="no">닫기</button></div>');
+    $('[data-x="no"]', m).onclick = () => m.remove();
+    $('#fo-ren', m).onclick = async () => {
+      m.remove();
+      const name = await promptModal('폴더 이름 변경', '폴더 이름', folder.name);
+      if (!name) return;
+      folder.name = name;
+      await VN.db.saveFolder(folder);
+      route();
+    };
+    $('#fo-del', m).onclick = async () => {
+      m.remove();
+      if (await confirmModal('폴더 삭제', '폴더를 삭제하면 안의 노트는 전체 노트로 이동합니다.', '삭제', true)) {
+        await VN.db.deleteFolder(folder.id);
+        go('#/list');
+      }
+    };
   }
 
   /* ══════════════ 노트 리스트 ══════════════ */
@@ -362,81 +392,147 @@ VN.ui = (function () {
     let notes = S.notes;
     if (opts.folderId) notes = notes.filter(n => n.folderId === opts.folderId);
     if (opts.favorite) notes = notes.filter(n => n.favorite);
+    const hash = location.hash || '#/list';
+    const isOn = (h) => (h === '#/list' ? (hash === '' || hash === '#' || hash === '#/list') : hash === h);
 
-    const title = folder ? folder.name : (opts.favorite ? '즐겨찾기' : '전체 노트');
-    let html = '<div class="view"><div class="view-header">' +
-      '<h1>' + U.esc(title) + '</h1>';
-    if (folder) {
-      html += '<button class="icon-btn" id="btn-folder-rename" title="이름 변경">✏️</button>' +
-        '<button class="icon-btn" id="btn-folder-del" title="폴더 삭제">🗑️</button>';
-    }
-    html += '<div class="spacer"></div>' +
-      '<div class="searchbar"><input type="search" id="list-search" placeholder="노트 검색 (제목·본문·메모)" value="' + U.esc(S.listQuery) + '"></div>' +
-      '<select id="list-sort">' +
-      '<option value="recent"' + (S.sort === 'recent' ? ' selected' : '') + '>최신순</option>' +
-      '<option value="title"' + (S.sort === 'title' ? ' selected' : '') + '>제목순</option>' +
-      '<option value="duration"' + (S.sort === 'duration' ? ' selected' : '') + '>길이순</option>' +
-      '</select></div><div id="note-list"></div>' +
-      '<button class="record-fab" id="record-fab">● 새 녹음</button></div>';
-    main().innerHTML = html;
-    $('#record-fab').onclick = () => go('#/record');
+    /* 상단 고정 헤더 + 가로 스크롤 필터 칩 */
+    const chips =
+      '<button class="filter-chip' + (isOn('#/list') ? ' on' : '') + '" data-go="#/list">전체</button>' +
+      '<button class="filter-chip' + (isOn('#/fav') ? ' on' : '') + '" data-go="#/fav">⭐ 즐겨찾기</button>' +
+      S.folders.map(f =>
+        '<button class="filter-chip' + (isOn('#/folder/' + f.id) ? ' on' : '') + '" data-go="#/folder/' + f.id +
+        '" data-folder="' + f.id + '">📁 ' + U.esc(f.name) +
+        (isOn('#/folder/' + f.id) ? '<span class="chip-more">⋯</span>' : '') + '</button>').join('') +
+      '<button class="filter-chip" id="chip-add-folder" aria-label="폴더 추가">＋ 폴더</button>';
+
+    main().innerHTML =
+      '<div class="topbar"><div class="topbar-row">' +
+      '<button class="home-logo" id="home-logo" aria-label="전체 노트로 이동"><span class="logo-dot"></span>보이스노트</button>' +
+      '<div class="spacer"></div>' +
+      '<button class="icon-btn plain" id="btn-import" aria-label="파일 불러오기">📂</button>' +
+      '<button class="icon-btn plain" id="btn-home-more" aria-label="더보기 메뉴">⋯</button>' +
+      '</div><div class="chip-row">' + chips + '</div></div>' +
+      '<div class="view under-2"><div id="note-list"></div></div>';
+
+    $('#home-logo').onclick = () => go('#/list');
+    $('#btn-import').onclick = () => $('#file-input').click();
+    $('#btn-home-more').onclick = (e) => {
+      const setSort = (v) => { S.sort = v; renderCards(); };
+      menuPop(e.currentTarget, [
+        { icon: '🗑️', label: '휴지통', onClick: () => go('#/trash') },
+        { sep: true }, { head: '정렬' },
+        { icon: S.sort === 'recent' ? '•' : '', label: '최신순', checked: S.sort === 'recent', onClick: () => setSort('recent') },
+        { icon: S.sort === 'title' ? '•' : '', label: '제목순', checked: S.sort === 'title', onClick: () => setSort('title') },
+        { icon: S.sort === 'duration' ? '•' : '', label: '길이순', checked: S.sort === 'duration', onClick: () => setSort('duration') }
+      ]);
+    };
+
+    /* 필터 칩 — 탭 이동, 현재 폴더 재탭·길게 누르면 이름변경·삭제 */
+    $$('.chip-row .filter-chip').forEach(c => {
+      const fid = c.dataset.folder;
+      let lpTimer = null, lpFired = false;
+      if (fid) {
+        c.addEventListener('pointerdown', () => {
+          lpFired = false;
+          lpTimer = setTimeout(() => { lpFired = true; folderManageModal(S.folders.find(f => f.id === fid)); }, 550);
+        });
+        ['pointerup', 'pointerleave', 'pointercancel'].forEach(ev => c.addEventListener(ev, () => clearTimeout(lpTimer)));
+      }
+      c.onclick = () => {
+        if (lpFired) { lpFired = false; return; }
+        if (c.id === 'chip-add-folder') return addFolderFlow();
+        if (fid && isOn(c.dataset.go)) return folderManageModal(S.folders.find(f => f.id === fid));
+        go(c.dataset.go);
+      };
+    });
 
     const renderCards = () => {
-      const q = S.listQuery.trim();
-      const results = searchNotes(sortNotes(notes), q);
+      const results = sortNotes(notes);
       const list = $('#note-list');
       if (!results.length) {
         list.innerHTML = '<div class="empty-state"><div class="big">🎙️</div>' +
-          (q ? '검색 결과가 없습니다.'
-            : '노트가 없습니다.<br>새 녹음을 시작하거나 오디오 파일을 끌어다 놓아 보세요.' +
-              '<div class="empty-actions">' +
-              '<button class="btn btn-primary" id="empty-rec">● 새 녹음</button>' +
-              '<button class="btn btn-outline" id="empty-import">파일 불러오기</button></div>') +
-          '</div>';
-        if (!q) {
-          $('#empty-rec').onclick = () => go('#/record');
-          $('#empty-import').onclick = () => $('#file-input').click();
-        }
+          (opts.favorite ? '즐겨찾기한 노트가 없습니다.'
+            : folder ? '이 폴더에 노트가 없습니다.'
+              : '노트가 없습니다.<br>첫 녹음을 시작해 보세요.') +
+          '<div class="empty-actions">' +
+          '<button class="btn btn-primary" id="empty-rec">● 첫 녹음 시작</button>' +
+          '<button class="btn btn-outline" id="empty-import">파일 불러오기</button></div></div>';
+        $('#empty-rec').onclick = () => go('#/record');
+        $('#empty-import').onclick = () => $('#file-input').click();
         return;
       }
-      list.innerHTML = results.map(({ note: n, snippet }) => {
-        const preview = n.transcribePending ? '⏳ 텍스트 변환 중…'
-          : (q && snippet ? markText(snippet, q) : U.esc(noteText(n).slice(0, 120) || '(전사 없음)'));
+      list.innerHTML = results.map(n => {
+        const preview = n.transcribePending ? '⏳ 텍스트 변환 중…' : U.esc(noteText(n).slice(0, 90) || '(전사 없음)');
         const fname = n.folderId ? (S.folders.find(f => f.id === n.folderId) || {}).name : null;
-        return '<button class="note-card" data-id="' + n.id + '">' +
-          '<div class="nc-title">' + (n.favorite ? '<span class="star">★</span>' : '') + markText(n.title || '제목 없음', q) + '</div>' +
+        return '<div class="note-card" data-id="' + n.id + '" role="button" tabindex="0">' +
+          '<div class="nc-title">' + U.esc(n.title || '제목 없음') + '</div>' +
           '<div class="nc-preview">' + preview + '</div>' +
           '<div class="nc-meta"><span>' + U.fmtDate(n.createdAt) + '</span><span>⏱ ' + U.fmtTime(n.duration) + '</span>' +
-          (fname ? '<span>📁 ' + U.esc(fname) + '</span>' : '') +
+          (fname ? '<span class="tag">📁 ' + U.esc(fname) + '</span>' : '') +
           (n.tags || []).map(t => '<span class="tag green">#' + U.esc(t) + '</span>').join('') +
-          (n.audioBlob ? '' : '<span class="tag">오디오 없음</span>') +
-          '</div></button>';
+          (n.audioBlob ? '' : '<span class="tag">오디오 없음</span>') + '</div>' +
+          '<button class="nc-star' + (n.favorite ? ' on' : '') + '" data-star="' + n.id + '" aria-label="즐겨찾기">' +
+          (n.favorite ? '★' : '☆') + '</button></div>';
       }).join('');
-      $$('.note-card', list).forEach(c => c.onclick = () => {
-        if (S.listQuery.trim()) S.pendingJump = S.listQuery.trim();
-        go('#/note/' + c.dataset.id);
+      $$('.note-card', list).forEach(c => {
+        const open = () => go('#/note/' + c.dataset.id);
+        c.onclick = (e) => { if (e.target.closest('.nc-star')) return; open(); };
+        c.onkeydown = (e) => { if (e.key === 'Enter') open(); };
+      });
+      $$('.nc-star', list).forEach(b => b.onclick = async (e) => {
+        e.stopPropagation();
+        const n = S.notes.find(x => x.id === b.dataset.star);
+        if (!n) return;
+        n.favorite = !n.favorite;
+        await saveNote(n);
+        if (opts.favorite) notes = S.notes.filter(x => x.favorite);
+        renderCards();
       });
     };
     renderCards();
+  }
 
-    $('#list-search').oninput = U.debounce((e) => { S.listQuery = e.target.value; renderCards(); }, 200);
-    $('#list-sort').onchange = (e) => { S.sort = e.target.value; renderCards(); };
+  /* ══════════════ 전역 검색 화면 ══════════════ */
 
-    if (folder) {
-      $('#btn-folder-rename').onclick = async () => {
-        const name = await promptModal('폴더 이름 변경', '폴더 이름', folder.name);
-        if (!name) return;
-        folder.name = name;
-        await VN.db.saveFolder(folder);
-        route();
-      };
-      $('#btn-folder-del').onclick = async () => {
-        if (await confirmModal('폴더 삭제', '폴더를 삭제하면 안의 노트는 전체 노트로 이동합니다.', '삭제', true)) {
-          await VN.db.deleteFolder(folder.id);
-          go('#/list');
-        }
-      };
-    }
+  function viewSearch() {
+    main().innerHTML =
+      '<div class="topbar"><div class="topbar-row">' +
+      '<button class="icon-btn plain" id="sr-back" aria-label="뒤로">←</button>' +
+      '<div class="searchbar"><input type="search" id="sr-q" placeholder="노트 검색 (제목·본문·메모)" value="' +
+      U.esc(S.listQuery) + '" aria-label="검색어"></div>' +
+      '</div></div>' +
+      '<div class="view under-1"><div id="sr-results"></div></div>';
+    $('#sr-back').onclick = () => go('#/list');
+
+    const renderResults = () => {
+      const q = S.listQuery.trim();
+      const box = $('#sr-results');
+      if (!box) return;
+      if (!q) {
+        box.innerHTML = '<div class="empty-state"><div class="big">🔍</div>노트 제목·본문·메모에서 검색합니다.</div>';
+        return;
+      }
+      const results = searchNotes(sortNotes(S.notes), q);
+      if (!results.length) {
+        box.innerHTML = '<div class="empty-state"><div class="big">🔍</div>"' + U.esc(q) + '" 검색 결과가 없습니다.</div>';
+        return;
+      }
+      box.innerHTML = results.map(({ note: n, snippet }) =>
+        '<div class="note-card" data-id="' + n.id + '" role="button" tabindex="0">' +
+        '<div class="nc-title">' + markText(n.title || '제목 없음', q) + '</div>' +
+        (snippet ? '<div class="search-snippet">' + markText(snippet, q) + '</div>' : '') +
+        '<div class="nc-meta"><span>' + U.fmtDate(n.createdAt) + '</span><span>⏱ ' + U.fmtTime(n.duration) + '</span></div>' +
+        '</div>').join('');
+      $$('.note-card', box).forEach(c => c.onclick = () => {
+        S.pendingJump = S.listQuery.trim();
+        go('#/note/' + c.dataset.id);
+      });
+    };
+    renderResults();
+    const input = $('#sr-q');
+    input.focus();
+    input.oninput = U.debounce((e) => { S.listQuery = e.target.value; renderResults(); }, 200);
+    input.onkeydown = (e) => { if (e.key === 'Enter') input.blur(); };
   }
 
   /* ══════════════ 노트 상세 ══════════════ */
@@ -454,108 +550,55 @@ VN.ui = (function () {
     S.editingSeg = null;
 
     const hasAudio = note.audioBlob instanceof Blob;
-    let html = '<div class="view">' +
-      '<div class="note-title-row">' +
-      '<button class="icon-btn" id="btn-back" title="목록으로">←</button>' +
-      '<input class="note-title-input" id="note-title" value="' + U.esc(note.title) + '">' +
-      '<button class="icon-btn' + (note.favorite ? ' on' : '') + '" id="btn-fav" title="즐겨찾기">' + (note.favorite ? '★' : '☆') + '</button>' +
-      '<button class="icon-btn" id="btn-share" title="공유">↗</button>' +
-      /* 모바일에서는 부가 동작을 ⋯ 메뉴로 접어 상단을 두 줄 이내로 압축 (데스크톱은 인라인 그대로) */
-      '<span class="nt-more-wrap">' +
-      '<button class="icon-btn" id="btn-more" title="더보기" aria-label="더보기">⋯</button>' +
-      '<span class="nt-more-menu">' +
-      '<button class="icon-btn" id="btn-export" title="다운로드">⬇<span class="nt-lbl"> 다운로드</span></button>' +
-      '<button class="icon-btn" id="btn-drive-save" title="Drive 저장">☁<span class="nt-lbl"> Drive 저장</span></button>' +
-      '<button class="icon-btn" id="btn-cal" title="일정 연결">📅<span class="nt-lbl"> 일정 연결</span></button>' +
-      (hasAudio ? '<button class="icon-btn" id="btn-regem" title="다시 변환(자동)">🎤<span class="nt-lbl"> 다시 변환</span></button>' : '') +
-      '<button class="icon-btn" id="btn-del-note" title="삭제">🗑<span class="nt-lbl"> 삭제</span></button>' +
-      '</span></span>' +
+    const folderName = note.folderId ? ((S.folders.find(f => f.id === note.folderId) || {}).name || null) : null;
+
+    /* 상단 고정 앱바(←·제목·⋯) + 고정 세그먼트 탭 */
+    let html = '<div class="topbar"><div class="topbar-row">' +
+      '<button class="icon-btn plain" id="btn-back" aria-label="목록으로">←</button>' +
+      '<input class="note-title-input" id="note-title" value="' + U.esc(note.title) + '" aria-label="노트 제목">' +
+      '<button class="icon-btn plain" id="btn-more" aria-label="더보기 메뉴">⋯</button>' +
       '</div>' +
+      '<div class="tabs" role="tablist" aria-label="노트 탭">' +
+      '<button class="tab active" role="tab" aria-selected="true" data-tab="seg">음성 기록</button>' +
+      '<button class="tab" role="tab" aria-selected="false" data-tab="ai">AI 요약</button>' +
+      '<button class="tab" role="tab" aria-selected="false" data-tab="memo">메모 <span class="faint">' + (note.memos || []).length + '</span></button>' +
+      '</div></div>';
+
+    html += '<div class="view under-2' + (hasAudio ? ' with-player' : '') + '">' +
       '<div class="note-info">' +
       '<span>' + U.fmtDate(note.createdAt) + '</span>' +
       '<span>⏱ ' + U.fmtTime(note.duration) + '</span>' +
       '<span>' + (LANG_LABEL[note.language] || note.language || '-') + '</span>' +
+      (folderName ? '<span>📁 ' + U.esc(folderName) + '</span>' : '') +
       (note.tags || []).map(t => '<span class="tag green">#' + U.esc(t) + '</span>').join('') +
       (note.calendar && note.calendar.title ? '<span title="연결된 일정">📅 ' + U.esc(note.calendar.title) + '</span>' : '') +
       (note.driveLink && /^https:\/\//.test(note.driveLink)
         ? '<span><a href="' + U.esc(note.driveLink) + '" target="_blank" rel="noopener">Drive에서 열기 ↗</a></span>' : '') +
-      '<span>📁 <select id="note-folder"><option value="">전체 노트</option>' +
-      S.folders.map(f => '<option value="' + f.id + '"' + (note.folderId === f.id ? ' selected' : '') + '>' + U.esc(f.name) + '</option>').join('') +
-      '</select></span>' +
-      '</div>';
+      '</div>' +
+      (hasAudio ? '' : '<div class="banner info">이 노트에는 오디오가 없습니다.</div>') +
+      '<div id="tab-body"></div></div>';
 
+    /* 하단 고정 플레이어 바 (내비 위) — 스크롤 중에도 항상 조작 가능 */
     if (hasAudio) {
-      html += '<div class="player-bar">' +
-        '<canvas class="player-wave" id="pl-wave"></canvas>' +
+      html += '<div class="player-dock">' +
+        '<canvas class="player-wave" id="pl-wave" aria-label="파형 시크바"></canvas>' +
         '<div class="player-controls">' +
-        '<button class="btn-play" id="pl-toggle">▶</button>' +
-        '<button class="icon-btn" id="pl-back10" title="10초 뒤로">⟲10</button>' +
-        '<button class="icon-btn" id="pl-fwd10" title="10초 앞으로">10⟳</button>' +
-        '<button class="icon-btn" id="pl-speed" title="배속">1.0×</button>' +
-        '<button class="icon-btn" id="pl-ab" title="A-B 구간 반복">A-B</button>' +
+        '<button class="btn-play" id="pl-toggle" aria-label="재생/일시정지">▶</button>' +
+        '<button class="icon-btn" id="pl-back10" aria-label="10초 뒤로">⟲10</button>' +
+        '<button class="icon-btn" id="pl-fwd10" aria-label="10초 앞으로">10⟳</button>' +
+        '<button class="icon-btn" id="pl-speed" aria-label="배속">1.0×</button>' +
+        '<button class="icon-btn" id="pl-ab" aria-label="A-B 구간 반복">A-B</button>' +
         '<span class="player-time" id="pl-time">00:00 / ' + U.fmtTime(note.duration) + '</span>' +
-        '<button class="icon-btn" id="pl-dl-audio" title="원본 오디오 다운로드">🎵⬇</button>' +
-        '</div></div>';
-      html += '<audio id="note-audio" preload="metadata" style="display:none"></audio>';
-    } else {
-      html += '<div class="banner info">이 노트에는 오디오가 없습니다.</div>';
+        '</div></div>' +
+        '<audio id="note-audio" preload="metadata" style="display:none"></audio>';
     }
-
-    // 참석자 + 발화 비율
-    html += '<details class="ai-block" style="margin-bottom:12px"><summary style="cursor:pointer;font-weight:600">참석자 · 발화 비율</summary>' +
-      '<div id="speaker-panel"></div></details>';
-
-    html += '<div class="tabs">' +
-      '<button class="tab active" data-tab="seg">음성 기록</button>' +
-      '<button class="tab" data-tab="memo">메모 <span class="faint">' + (note.memos || []).length + '</span></button>' +
-      '<button class="tab" data-tab="ai">AI 요약</button>' +
-      '</div><div id="tab-body"></div></div>';
 
     main().innerHTML = html;
 
-    /* 헤더 이벤트 */
+    /* 앱바 이벤트 */
     $('#btn-back').onclick = () => go('#/list');
-    /* ⋯ 더보기 메뉴 (모바일 전용 — 데스크톱은 CSS로 인라인 표시) */
-    const moreWrap = $('.nt-more-wrap');
-    $('#btn-more').onclick = (e) => { e.stopPropagation(); moreWrap.classList.toggle('open'); };
-    $('.nt-more-menu').addEventListener('click', () => moreWrap.classList.remove('open'));
     $('#note-title').onchange = async (e) => { note.title = e.target.value.trim() || '제목 없음'; await saveNote(note); };
-    $('#btn-fav').onclick = async (e) => {
-      note.favorite = !note.favorite;
-      await saveNote(note);
-      e.target.classList.toggle('on', note.favorite);
-      e.target.textContent = note.favorite ? '★' : '☆';
-    };
-    $('#note-folder').onchange = async (e) => { note.folderId = e.target.value || null; await saveNote(note); toast('폴더를 이동했습니다.'); };
-    $('#btn-del-note').onclick = async () => {
-      if (await confirmModal('노트 삭제', '휴지통으로 이동합니다. 30일 후 자동으로 영구 삭제됩니다.', '삭제', true)) {
-        if (S.player) { S.player.destroy(); S.player = null; }
-        await VN.db.trashNote(note.id);
-        toast('휴지통으로 이동했습니다.');
-        go('#/list');
-      }
-    };
-    $('#btn-share').onclick = () => shareModal(note);
-    $('#btn-export').onclick = () => exportModal(note);
-    $('#btn-drive-save').onclick = async () => {
-      const b = $('#btn-drive-save');
-      b.disabled = true;
-      toast('Drive 저장 중…');
-      try {
-        const r = await VN.drive.saveNoteToDrive(note);
-        toast(r.message || (r.saved ? 'Drive에 저장했습니다.' : 'Drive 저장을 건너뛰었습니다.'));
-        if (r.titleChanged && $('#note-title')) $('#note-title').value = note.title;
-        if (r.authExpired) notifyAuthExpired();
-      } catch (e) { toast('Drive 저장 실패: ' + (e.message || e)); }
-      b.disabled = false;
-    };
-    if ($('#btn-regem')) $('#btn-regem').onclick = () => retranscribeAuto(note);
-    /* 일정 연결 — 로그인/권한 없으면 조용히 버튼을 숨긴다 */
-    $('#btn-cal').onclick = () => calendarLinkModal(note);
-    VN.gcal.available().then(ok => {
-      const b = $('#btn-cal');
-      if (b && !ok) b.remove();
-    }).catch(() => { const b = $('#btn-cal'); if (b) b.remove(); });
+    $('#btn-more').onclick = (e) => noteMenu(note, e.currentTarget);
 
     /* 플레이어 */
     if (hasAudio) {
@@ -584,17 +627,12 @@ VN.ui = (function () {
         else if (st === 'B') { b.textContent = 'A-B'; b.classList.add('on'); toast('A-B 구간 반복을 시작합니다.'); }
         else { b.textContent = 'A-B'; b.classList.remove('on'); toast('구간 반복을 해제했습니다.'); }
       };
-      $('#pl-dl-audio').onclick = () => {
-        const ext = (note.audioBlob.type || '').includes('wav') ? 'wav' : (note.audioBlob.type || '').includes('mp4') ? 'm4a' : (note.audioBlob.type || '').includes('mpeg') ? 'mp3' : 'webm';
-        VN.exporter.download(VN.exporter.safeName(note.title) + '.' + ext, note.audioBlob);
-      };
     }
 
-    renderSpeakerPanel(note);
-
     $$('.tab').forEach(t => t.onclick = () => {
-      $$('.tab').forEach(x => x.classList.remove('active'));
+      $$('.tab').forEach(x => { x.classList.remove('active'); x.setAttribute('aria-selected', 'false'); });
       t.classList.add('active');
+      t.setAttribute('aria-selected', 'true');
       S.noteTab = t.dataset.tab;
       renderTabBody(note);
     });
@@ -609,12 +647,84 @@ VN.ui = (function () {
     }
   }
 
-  /* ── 참석자 패널: 이름 변경/병합 + 발화 비율 차트(SVG) ── */
-  function renderSpeakerPanel(note) {
-    const panel = $('#speaker-panel');
-    if (!panel) return;
-    const used = new Set((note.segments || []).map(s => s.speaker || 0));
+  /* ── 노트 ⋯ 메뉴 — 공유·다운로드·Drive·일정·재변환·폴더 이동·즐겨찾기·삭제 ── */
+  function noteMenu(note, anchor) {
+    const hasAudio = note.audioBlob instanceof Blob;
+    const items = [
+      {
+        icon: note.favorite ? '★' : '☆', label: note.favorite ? '즐겨찾기 해제' : '즐겨찾기',
+        onClick: async () => {
+          note.favorite = !note.favorite;
+          await saveNote(note);
+          toast(note.favorite ? '즐겨찾기에 추가했습니다.' : '즐겨찾기를 해제했습니다.');
+        }
+      },
+      { icon: '↗', label: '공유', onClick: () => shareModal(note) },
+      { icon: '⬇', label: '다운로드', onClick: () => exportModal(note) },
+      { icon: '☁', label: 'Drive 저장', onClick: () => driveSaveNow(note) }
+    ];
+    if (note.driveLink && /^https:\/\//.test(note.driveLink)) {
+      items.push({ icon: '🔗', label: 'Drive에서 열기', onClick: () => window.open(note.driveLink, '_blank', 'noopener') });
+    }
+    items.push({
+      icon: '📅', label: '일정 연결',
+      onClick: async () => {
+        let ok = false;
+        try { ok = await VN.gcal.available(); } catch (e) { ok = false; }
+        if (!ok) { toast('설정에서 Google 로그인 후 사용할 수 있습니다.'); return; }
+        calendarLinkModal(note);
+      }
+    });
+    if (hasAudio) items.push({ icon: '🎤', label: '다시 변환', onClick: () => retranscribeMenu(note) });
+    items.push({ icon: '📁', label: '폴더 이동', onClick: () => folderMoveModal(note) });
+    items.push({ sep: true });
+    items.push({ icon: '🗑', label: '삭제', danger: true, onClick: () => deleteNoteFlow(note) });
+    menuPop(anchor, items);
+  }
+
+  async function driveSaveNow(note) {
+    toast('Drive 저장 중…');
+    try {
+      const r = await VN.drive.saveNoteToDrive(note);
+      toast(r.message || (r.saved ? 'Drive에 저장했습니다.' : 'Drive 저장을 건너뛰었습니다.'));
+      if (r.titleChanged && $('#note-title')) $('#note-title').value = note.title;
+      if (r.authExpired) notifyAuthExpired();
+    } catch (e) { toast('Drive 저장 실패: ' + (e.message || e)); }
+  }
+
+  async function deleteNoteFlow(note) {
+    if (await confirmModal('노트 삭제', '휴지통으로 이동합니다. 30일 후 자동으로 영구 삭제됩니다.', '삭제', true)) {
+      if (S.player) { S.player.destroy(); S.player = null; }
+      await VN.db.trashNote(note.id);
+      toast('휴지통으로 이동했습니다.');
+      go('#/list');
+    }
+  }
+
+  function folderMoveModal(note) {
+    const m = modal('<h2>📁 폴더 이동</h2><div class="modal-body"><div class="form-row"><label>폴더</label>' +
+      '<select id="fm-sel"><option value="">전체 노트 (폴더 없음)</option>' +
+      S.folders.map(f => '<option value="' + f.id + '"' + (note.folderId === f.id ? ' selected' : '') + '>' + U.esc(f.name) + '</option>').join('') +
+      '</select></div></div>' +
+      '<div class="modal-actions"><button class="btn" data-x="no">취소</button><button class="btn btn-primary" data-x="ok">이동</button></div>');
+    $('[data-x="no"]', m).onclick = () => m.remove();
+    $('[data-x="ok"]', m).onclick = async () => {
+      note.folderId = $('#fm-sel', m).value || null;
+      await saveNote(note);
+      m.remove();
+      toast('폴더를 이동했습니다.');
+      viewNote(note.id);
+    };
+  }
+
+  /* ── 참석자: 발화 비율 차트(AI 요약 탭 하단) + 이름 변경·병합 모달(음성 기록 탭 도구) ── */
+  function usedSpeakerIdxs(note) {
     if (!(note.speakers || []).length) note.speakers = [{ name: '참석A' }];
+    return [...new Set((note.segments || []).map(s => s.speaker || 0))].sort((a, b) => a - b);
+  }
+
+  function speakerChartHtml(note) {
+    const idxs = usedSpeakerIdxs(note);
     const totals = {};
     let grand = 0;
     for (const s of (note.segments || [])) {
@@ -622,15 +732,12 @@ VN.ui = (function () {
       totals[s.speaker || 0] = (totals[s.speaker || 0] || 0) + d;
       grand += d;
     }
-    const idxs = [...used].sort((a, b) => a - b);
     let legend = '<div class="speaker-legend">';
     for (const i of idxs) {
       legend += '<span class="sp"><span class="sp-dot" style="background:' + speakerColor(i) + '"></span>' +
         U.esc(speakerName(note, i)) + ' <span class="faint">' + (grand ? Math.round((totals[i] || 0) / grand * 100) : 0) + '%</span></span>';
     }
-    legend += '<button class="btn btn-sm btn-outline" id="btn-speakers-edit">이름 변경·병합</button></div>';
-
-    // 발화 비율 가로 막대 SVG
+    legend += '</div>';
     let svg = '';
     if (grand > 0 && idxs.length) {
       const W = 560, BH = 22, GAP = 8;
@@ -645,43 +752,43 @@ VN.ui = (function () {
       });
       svg += '</svg>';
     }
-    panel.innerHTML = legend + svg;
+    return legend + svg;
+  }
 
-    $('#btn-speakers-edit').onclick = () => {
-      const rows = idxs.map(i =>
-        '<div class="settings-row" data-idx="' + i + '">' +
-        '<span class="sp-dot" style="background:' + speakerColor(i) + '"></span>' +
-        '<input type="text" class="sp-name" value="' + U.esc(speakerName(note, i)) + '" style="flex:1;min-width:100px">' +
-        '<select class="sp-merge"><option value="">병합 안 함</option>' +
-        idxs.filter(j => j !== i).map(j => '<option value="' + j + '">→ ' + U.esc(speakerName(note, j)) + '에 병합</option>').join('') +
-        '</select></div>'
-      ).join('');
-      const m = modal('<h2>참석자 이름 변경 · 병합</h2><div class="modal-body">' + rows +
-        '<p class="muted small">병합하면 해당 참석자의 모든 발화가 대상 참석자로 합쳐집니다.</p></div>' +
-        '<div class="modal-actions"><button class="btn" data-x="no">취소</button><button class="btn btn-primary" data-x="ok">저장</button></div>');
-      $('[data-x="no"]', m).onclick = () => m.remove();
-      $('[data-x="ok"]', m).onclick = async () => {
-        // 이름 일괄 변경
-        $$('.settings-row', m).forEach(row => {
-          const i = +row.dataset.idx;
-          const name = $('.sp-name', row).value.trim();
-          if (!note.speakers[i]) note.speakers[i] = {};
-          if (name) note.speakers[i].name = name;
-        });
-        // 병합
-        $$('.settings-row', m).forEach(row => {
-          const from = +row.dataset.idx;
-          const to = $('.sp-merge', row).value;
-          if (to !== '') {
-            for (const s of (note.segments || [])) if ((s.speaker || 0) === from) s.speaker = +to;
-          }
-        });
-        await saveNote(note);
-        m.remove();
-        renderSpeakerPanel(note);
-        renderTabBody(note);
-        toast('참석자 정보를 저장했습니다.');
-      };
+  function speakersEditModal(note) {
+    const idxs = usedSpeakerIdxs(note);
+    const rows = idxs.map(i =>
+      '<div class="settings-row" data-idx="' + i + '">' +
+      '<span class="sp-dot" style="background:' + speakerColor(i) + '"></span>' +
+      '<input type="text" class="sp-name" value="' + U.esc(speakerName(note, i)) + '" style="flex:1;min-width:100px">' +
+      '<select class="sp-merge"><option value="">병합 안 함</option>' +
+      idxs.filter(j => j !== i).map(j => '<option value="' + j + '">→ ' + U.esc(speakerName(note, j)) + '에 병합</option>').join('') +
+      '</select></div>'
+    ).join('');
+    const m = modal('<h2>참석자 이름 변경 · 병합</h2><div class="modal-body">' + rows +
+      '<p class="muted small">병합하면 해당 참석자의 모든 발화가 대상 참석자로 합쳐집니다.</p></div>' +
+      '<div class="modal-actions"><button class="btn" data-x="no">취소</button><button class="btn btn-primary" data-x="ok">저장</button></div>');
+    $('[data-x="no"]', m).onclick = () => m.remove();
+    $('[data-x="ok"]', m).onclick = async () => {
+      // 이름 일괄 변경
+      $$('.settings-row', m).forEach(row => {
+        const i = +row.dataset.idx;
+        const name = $('.sp-name', row).value.trim();
+        if (!note.speakers[i]) note.speakers[i] = {};
+        if (name) note.speakers[i].name = name;
+      });
+      // 병합
+      $$('.settings-row', m).forEach(row => {
+        const from = +row.dataset.idx;
+        const to = $('.sp-merge', row).value;
+        if (to !== '') {
+          for (const s of (note.segments || [])) if ((s.speaker || 0) === from) s.speaker = +to;
+        }
+      });
+      await saveNote(note);
+      m.remove();
+      renderTabBody(note);
+      toast('참석자 정보를 저장했습니다.');
     };
   }
 
@@ -723,6 +830,7 @@ VN.ui = (function () {
       '<button class="filter-chip' + (S.segFilter === 'highlight' ? ' on' : '') + '" data-f="highlight">🖍 하이라이트만</button>' +
       spChips +
       '<div class="spacer" style="flex:1"></div>' +
+      '<button class="btn btn-sm btn-outline" id="btn-speakers-edit" aria-label="참석자 이름 변경·병합">👥 참석자</button>' +
       '<button class="btn btn-sm btn-outline" id="btn-add-seg">＋ 구간 추가</button>' +
       '</div>' +
       '<div class="note-search-bar">' +
@@ -758,6 +866,7 @@ VN.ui = (function () {
     });
     $$('[data-bm-time]', body).forEach(c => c.onclick = () => { if (S.player) S.player.playFrom(+c.dataset.bmTime); });
 
+    $('#btn-speakers-edit').onclick = () => speakersEditModal(note);
     $('#btn-add-seg').onclick = async () => {
       const t = S.player ? S.player.currentTime : ((note.segments.slice(-1)[0] || {}).end || 0);
       note.segments.push({ id: U.uid(), speaker: 0, start: t, end: t + 3, text: '', bookmarked: false, highlighted: false });
@@ -993,7 +1102,9 @@ VN.ui = (function () {
       '<div id="ask-history"></div>' +
       '<div class="record-memo-row" style="margin-top:8px">' +
       '<input type="text" id="ask-q" placeholder="이 녹음 내용에 대해 질문하세요">' +
-      '<button class="btn btn-primary" id="ask-send">보내기</button></div></div>';
+      '<button class="btn btn-primary" id="ask-send">보내기</button></div></div>' +
+      /* 참석자별 발화 비율 차트 — AI 요약 탭 하단 */
+      '<div class="ai-block"><h3><span class="dot"></span>참석자 · 발화 비율</h3>' + speakerChartHtml(note) + '</div>';
     body.innerHTML = html;
 
     /* Ask AI: 질문·답변 이력(노트에 최근 20개 저장) */
@@ -1275,34 +1386,56 @@ VN.ui = (function () {
     // 실시간 자막을 끄고 녹음 종료 후 사후 전사를 안내한다.
     const mobile = isMobile();
     const MOBILE_NOTICE = '모바일에서는 실시간 자막이 지원되지 않습니다. 녹음을 마치면 자동으로 텍스트 변환이 시작됩니다.';
-    let html = '<div class="view record-wrap">';
+    /* 상단 고정 앱바: ←(취소·확인 모달) + 제목 + 화면 켜짐 유지 토글 */
+    let html = '<div class="topbar"><div class="topbar-row">' +
+      '<button class="icon-btn plain" id="rec-back" aria-label="녹음 취소·뒤로">←</button>' +
+      '<h1 class="bar-title">녹음</h1><div class="spacer"></div>' +
+      '<span class="check-row" id="rec-wl-row" style="margin:0"><input type="checkbox" id="rec-wakelock">' +
+      '<label for="rec-wakelock" class="small">화면 켜짐 유지</label></span>' +
+      '</div></div>';
+    html += '<div class="view under-1 record-wrap">';
     if (!recSupported) {
       html += '<div class="banner">이 브라우저는 녹음(MediaRecorder)을 지원하지 않습니다. Chrome 또는 Edge를 사용해 주세요.</div>';
     }
     if (!sttSupported && !mobile) {
       html += '<div class="banner">이 브라우저는 음성인식(SpeechRecognition)을 지원하지 않아 자막 없이 녹음만 진행됩니다. (Chrome/Edge 권장)</div>';
     }
-    html += '<div id="rec-cal"></div>';
-    html += '<div class="settings-row" style="justify-content:center"><label>인식 언어</label>' +
-      '<select id="rec-lang">' +
+    html += '<div id="rec-cal"></div>' +
+      '<div class="settings-row" style="justify-content:center"><label for="rec-lang">인식 언어</label>' +
+      '<select id="rec-lang" aria-label="인식 언어" style="flex:0 1 auto">' +
       '<option value="ko-KR">한국어</option><option value="en-US">영어 (미국)</option>' +
       '<option value="ja-JP">일본어</option><option value="zh-CN">중국어 (간체)</option></select></div>' +
-      '<div class="check-row" id="rec-wl-row" style="justify-content:center"><input type="checkbox" id="rec-wakelock"><label for="rec-wakelock" class="small">화면 켜짐 유지 (Wake Lock)</label></div>' +
       '<div class="record-timer" id="rec-timer">00:00</div>' +
       '<div class="record-state" id="rec-state">녹음 대기 중</div>' +
       '<canvas id="record-wave" width="640" height="90"></canvas>' +
-      '<div class="record-controls" id="rec-controls">' +
-      '<button class="btn btn-primary" id="rec-start"' + (recSupported ? '' : ' disabled') + '>● 녹음 시작</button>' +
-      '</div>' +
       '<div class="speaker-tabs" id="rec-speakers"></div>' +
       '<div id="rec-warn"></div>' +
       '<div class="stt-live" id="stt-live"><span class="faint">' +
       (mobile ? MOBILE_NOTICE : '녹음을 시작하면 실시간 자막이 여기에 표시됩니다.') + '</span></div>' +
       '<div class="record-memo-row">' +
-      '<button class="icon-btn" id="rec-bookmark" title="현재 시점 북마크" disabled>🔖</button>' +
-      '<input type="text" id="rec-memo" placeholder="타임스탬프 메모 입력 후 Enter" disabled>' +
+      '<button class="icon-btn" id="rec-bookmark" aria-label="현재 시점 북마크" disabled>🔖</button>' +
+      '<input type="text" id="rec-memo" placeholder="📝 타임스탬프 메모 입력 후 Enter" aria-label="타임스탬프 메모" disabled>' +
+      '</div>' +
+      '<div class="record-controls" id="rec-controls">' +
+      '<button class="btn btn-primary btn-rec-start" id="rec-start"' + (recSupported ? '' : ' disabled') + '>● 녹음 시작</button>' +
       '</div></div>';
     main().innerHTML = html;
+
+    /* ← : 녹음 중이면 확인 모달 후 취소, 아니면 목록으로 */
+    $('#rec-back').onclick = async () => {
+      if (S.rec && S.rec.active) {
+        if (await confirmModal('녹음 취소', '지금까지 녹음한 내용이 모두 사라집니다.<br>저장하려면 ■ 종료 버튼을 누르세요.', '녹음 취소', true)) {
+          VN.stt.stop();
+          VN.recorder.cancel();
+          clearInterval(S.rec.timerId);
+          S.rec.active = false;
+          releaseWakeLock();
+          document.title = '보이스노트';
+          updateNav();
+          go('#/list');
+        }
+      } else go('#/list');
+    };
 
     if (!resuming) VN.db.getSetting('defaultLang', 'ko-KR').then(l => { $('#rec-lang') && ($('#rec-lang').value = l); });
 
@@ -1428,9 +1561,9 @@ VN.ui = (function () {
     const setControls = (mode) => {
       const c = $('#rec-controls');
       if (mode === 'recording') {
-        c.innerHTML = '<button class="btn" id="rec-pause">⏸ 일시정지</button>' +
-          '<button class="btn btn-primary" id="rec-stop">■ 중지·저장</button>' +
-          '<button class="btn btn-ghost" id="rec-cancel">취소</button>';
+        c.innerHTML = '<button class="rec-round" id="rec-pause" aria-label="일시정지">⏸</button>' +
+          '<button class="rec-round primary" id="rec-stop" aria-label="종료하고 저장">■</button>' +
+          '<button class="rec-round" id="rec-memo-focus" aria-label="메모 입력으로 이동">📝</button>';
         $('#rec-pause').onclick = () => {
           VN.recorder.pause();
           VN.stt.pause();
@@ -1438,9 +1571,9 @@ VN.ui = (function () {
           setControls('paused');
         };
       } else if (mode === 'paused') {
-        c.innerHTML = '<button class="btn btn-primary" id="rec-resume">▶ 재개</button>' +
-          '<button class="btn" id="rec-stop">■ 중지·저장</button>' +
-          '<button class="btn btn-ghost" id="rec-cancel">취소</button>';
+        c.innerHTML = '<button class="rec-round" id="rec-resume" aria-label="재개">▶</button>' +
+          '<button class="rec-round primary" id="rec-stop" aria-label="종료하고 저장">■</button>' +
+          '<button class="rec-round" id="rec-memo-focus" aria-label="메모 입력으로 이동">📝</button>';
         $('#rec-resume').onclick = () => {
           VN.recorder.resume();
           if (S.rec.sttOn) VN.stt.resume(S.rec.lang);
@@ -1449,17 +1582,7 @@ VN.ui = (function () {
         };
       }
       if ($('#rec-stop')) $('#rec-stop').onclick = () => finishRecording(false);
-      if ($('#rec-cancel')) $('#rec-cancel').onclick = async () => {
-        if (await confirmModal('녹음 취소', '지금까지 녹음한 내용이 모두 사라집니다.', '녹음 취소', true)) {
-          VN.stt.stop();
-          VN.recorder.cancel();
-          clearInterval(S.rec.timerId);
-          S.rec.active = false;
-          releaseWakeLock();
-          document.title = '보이스노트';
-          go('#/list');
-        }
-      };
+      if ($('#rec-memo-focus')) $('#rec-memo-focus').onclick = () => { const i = $('#rec-memo'); if (i) i.focus(); };
     };
 
     $('#rec-start').onclick = async () => {
@@ -1485,6 +1608,7 @@ VN.ui = (function () {
       }
       S.rec.active = true;
       S.rec.sttWarned = false;
+      updateNav();
       if ($('#rec-wakelock') && $('#rec-wakelock').checked) acquireWakeLock();
       live().innerHTML = mobile ? '<span class="faint">' + MOBILE_NOTICE + '</span>' : '';
       interimEl = null;
@@ -1585,6 +1709,7 @@ VN.ui = (function () {
     // 노트가 안전하게 저장됐으니 크래시 세이프 청크 정리
     try { await VN.db.clear('recChunks'); } catch (e) { /* ignore */ }
     S.rec = null;
+    updateNav();
     // 녹음 중 보류해 둔 배포 감지 배너가 있으면 이제 표시
     if (deployPendingWhileRec) { deployPendingWhileRec = false; showDeployBanner(); }
     // 전사 세그먼트가 없고 오디오가 충분히 길면(≈3초+) 묻지 않고 자동 텍스트 변환 시작
@@ -1675,7 +1800,6 @@ VN.ui = (function () {
     // 선택 모달 없이 자동으로 텍스트 변환 시작 (키가 없으면 노트에 안내가 남는다)
     for (const n of notes) await VN.transcribe.start(n);
     await refresh();
-    renderSidebar(location.hash);
     if (notes.length === 1) {
       go('#/note/' + notes[0].id);
     } else {
@@ -1684,18 +1808,85 @@ VN.ui = (function () {
     }
   }
 
-  /* ── 노트 상세 🎤: 방식 선택 없이 자동 재변환.
-       이미 세그먼트가 있는 노트만 대체 확인을 거친다. ── */
-  async function retranscribeAuto(note) {
+  /* ── 노트 상세 ⋯ → 다시 변환: 엔진 선택 (자동/Deepgram/AssemblyAI/Gemini/Whisper/수동) ── */
+  function retranscribeMenu(note) {
     if (!(note.audioBlob instanceof Blob)) { toast('오디오가 없는 노트입니다.'); return; }
     if (VN.transcribe.isActive(note.id)) { toast('이미 텍스트 변환이 진행 중입니다.'); return; }
-    if ((note.segments || []).length) {
-      const ok = await confirmModal('다시 변환(자동)',
-        '오디오 전체를 다시 텍스트로 변환합니다.<br>기존 세그먼트 ' +
-        note.segments.length + '개와 참석자 이름이 <b>대체</b>됩니다.', '다시 변환', true);
-      if (!ok) return;
+    const m = modal('<h2>🎤 다시 변환</h2><div class="modal-body">' +
+      '<p class="muted small" style="margin-bottom:10px">오디오 전체를 다시 텍스트로 변환합니다.' +
+      ((note.segments || []).length ? ' 기존 세그먼트 ' + note.segments.length + '개와 참석자 이름이 <b>대체</b>됩니다.' : '') + '</p>' +
+      [['auto', '⚡ 자동 (권장 — 저장된 키 순서대로)'],
+       ['deepgram', 'Deepgram (자동 화자분리)'],
+       ['assemblyai', 'AssemblyAI (자동 화자분리)'],
+       ['gemini', 'Gemini'],
+       ['whisper', 'Whisper (브라우저 내 처리 · 느림)'],
+       ['manual', '✎ 수동 입력 (구간 직접 추가)']].map(o =>
+        '<button class="btn btn-block" style="margin-bottom:8px;justify-content:flex-start" data-eng="' + o[0] + '">' + o[1] + '</button>').join('') +
+      '</div><div class="modal-actions"><button class="btn" data-x="no">취소</button></div>');
+    $('[data-x="no"]', m).onclick = () => m.remove();
+    $$('[data-eng]', m).forEach(b => b.onclick = () => { m.remove(); runRetranscribe(note, b.dataset.eng); });
+  }
+
+  async function runRetranscribe(note, engine) {
+    if (engine === 'manual') {
+      // 수동: 음성 기록 탭으로 이동해 빈 구간을 추가하고 바로 편집 시작
+      S.noteTab = 'seg';
+      $$('.tab').forEach(x => {
+        const on = x.dataset.tab === 'seg';
+        x.classList.toggle('active', on);
+        x.setAttribute('aria-selected', on ? 'true' : 'false');
+      });
+      renderTabBody(note);
+      const b = $('#btn-add-seg');
+      if (b) b.click();
+      return;
     }
-    await VN.transcribe.start(note);
+    if (engine === 'auto') {
+      const r = await VN.transcribe.start(note);
+      if (!r.started && r.reason === 'no-keys') go('#/settings');
+      else if (r.started) renderTabBody(note);   // pending 배너 표시
+      return;
+    }
+    // 개별 엔진 — 진행 표시와 함께 직접 실행
+    const m = modal('<h2>다시 변환 중…</h2><div class="modal-body">' +
+      '<div id="rt-msg" class="muted small">변환을 시작합니다…</div>' +
+      '<div class="progress-outer"><div class="progress-inner" id="rt-bar"></div></div></div>');
+    const setP = (pct, msg) => {
+      const bar = $('#rt-bar', m);
+      if (bar && isFinite(pct)) bar.style.width = Math.max(0, Math.min(100, pct)) + '%';
+      const t = $('#rt-msg', m);
+      if (t && msg) t.textContent = msg;
+    };
+    try {
+      if (engine === 'whisper') {
+        const segs = await VN.whisper.transcribe(note.audioBlob, { model: 'tiny', language: note.language, onProgress: setP });
+        if (!segs.length) throw new Error('인식된 음성이 없습니다.');
+        note.speakers = [{ name: U.speakerDefaultName(0) }];
+        note.segments = segs.map(sg => ({
+          id: U.uid(), speaker: 0, start: sg.start, end: sg.end, text: sg.text,
+          bookmarked: false, highlighted: false
+        }));
+      } else if (engine === 'gemini') {
+        setP(30, 'Gemini로 변환 중…');
+        const items = await VN.summarizer.transcribeAudioGemini(note.audioBlob, { language: note.language });
+        if (!items.length) throw new Error('인식된 음성이 없습니다.');
+        VN.transcribe._test.applyGeminiSegments(note, items);
+      } else {
+        setP(30, (engine === 'deepgram' ? 'Deepgram' : 'AssemblyAI') + '으로 변환 중…');
+        const r = await VN.diarize.transcribe(note.audioBlob, { provider: engine, language: note.language, onProgress: setP });
+        if (!r.segments.length) throw new Error('인식된 음성이 없습니다.');
+        VN.transcribe._test.applyDiarizeSegments(note, r);
+      }
+      note.transcribePending = false;
+      note.transcribeError = null;
+      await saveNote(note);
+      m.remove();
+      toast('텍스트 변환 완료 (' + note.segments.length + '개 구간)');
+      if (S.note && S.note.id === note.id) viewNote(note.id);
+    } catch (e) {
+      m.remove();
+      toast('변환 실패: ' + ((e && e.message) || e), 5000);
+    }
   }
 
   /* ══════════════ 캘린더 일정 연결 ══════════════ */
@@ -1760,11 +1951,16 @@ VN.ui = (function () {
 
   async function viewTrash() {
     const items = await VN.db.getTrash();
-    let html = '<div class="view"><div class="view-header"><h1>휴지통</h1><div class="spacer"></div>' +
-      (items.length ? '<button class="btn btn-danger btn-sm" id="btn-trash-empty">비우기</button>' : '') + '</div>' +
+    let html = '<div class="topbar"><div class="topbar-row">' +
+      '<button class="icon-btn plain" id="tr-back" aria-label="뒤로">←</button>' +
+      '<h1 class="bar-title">휴지통</h1><div class="spacer"></div>' +
+      (items.length ? '<button class="btn btn-danger btn-sm" id="btn-trash-empty">비우기</button>' : '') +
+      '</div></div>' +
+      '<div class="view under-1">' +
       '<p class="muted small" style="margin-bottom:14px">삭제된 노트는 30일간 보관 후 자동으로 영구 삭제됩니다.</p>' +
       '<div id="trash-list"></div></div>';
     main().innerHTML = html;
+    $('#tr-back').onclick = () => go('#/list');
     const list = $('#trash-list');
     if (!items.length) {
       list.innerHTML = '<div class="empty-state"><div class="big">🗑️</div>휴지통이 비어 있습니다.</div>';
@@ -1827,7 +2023,10 @@ VN.ui = (function () {
     const monthSec = monthNotes.reduce((a, n) => a + (n.duration || 0), 0);
     const totalSec = S.notes.reduce((a, n) => a + (n.duration || 0), 0);
 
-    let html = '<div class="view"><div class="view-header"><h1>설정</h1></div>';
+    let html = '<div class="topbar"><div class="topbar-row">' +
+      '<button class="icon-btn plain" id="st-back" aria-label="뒤로">←</button>' +
+      '<h1 class="bar-title">설정</h1></div></div>' +
+      '<div class="view under-1">';
 
     html += '<div class="settings-group"><h2>이번 달 사용량 <span class="faint small">(제한 없음)</span></h2>' +
       '<div class="stat-cards">' +
@@ -1977,6 +2176,8 @@ VN.ui = (function () {
     /* async 핸들러가 끝났을 때 이미 다른 화면으로 이동했을 수 있다 —
        설정 화면이 여전히 열려 있을 때만 재렌더한다 (다른 화면을 덮어쓰는 사고 방지) */
     const rerender = () => { if (location.hash.startsWith('#/settings')) viewSettings(); };
+
+    $('#st-back').onclick = () => go('#/list');
 
     if (navigator.storage && navigator.storage.estimate) {
       navigator.storage.estimate().then(est => {
@@ -2152,13 +2353,11 @@ VN.ui = (function () {
       if (S.theme === 'system') applyTheme('system');
     });
 
-    // 사이드바 토글(모바일)
-    $('#sidebar-toggle').onclick = () => $('#app').classList.toggle('sidebar-open');
-    $('#sidebar-backdrop').onclick = () => $('#app').classList.remove('sidebar-open');
+    // 하단 내비게이션 (모든 화면 공통)
+    $('#nav-search').onclick = () => go('#/search');
+    $('#nav-record').onclick = () => go('#/record');
+    $('#nav-settings').onclick = () => go('#/settings');
 
-    // 상단 버튼
-    $('#btn-new-record').onclick = () => go('#/record');
-    $('#btn-import-file').onclick = () => $('#file-input').click();
     $('#file-input').onchange = (e) => { if (e.target.files.length) { importFiles(e.target.files); e.target.value = ''; } };
     $('#restore-input').onchange = async (e) => {
       const f = e.target.files[0];

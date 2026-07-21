@@ -526,9 +526,11 @@ window.__vnDebug = {
   if (/^(localhost|127\.0\.0\.1)$/.test(location.hostname)) {
     const b = document.createElement('a');
     b.href = 'https://voicenote-l0ox.onrender.com';
-    b.textContent = '🧪 로컬 테스트 복사본 — 실사용(키·노트 저장)은 voicenote-l0ox.onrender.com';
-    b.style.cssText = 'position:fixed;bottom:0;left:0;right:0;z-index:9999;text-align:center;' +
-      'padding:6px 10px;font-size:12px;background:#7c5c00;color:#fff;text-decoration:none;opacity:.95';
+    b.textContent = '🧪 로컬 복사본';
+    b.title = '로컬 테스트 복사본 — 실사용(키·노트 저장)은 voicenote-l0ox.onrender.com';
+    // 하단 내비 위 좌측 작은 배지 — 플레이어 바(z-index 45)보다 아래라 노트 화면에선 가려진다
+    b.style.cssText = 'position:fixed;bottom:calc(66px + env(safe-area-inset-bottom));left:10px;z-index:44;' +
+      'padding:5px 10px;font-size:11px;border-radius:999px;background:#7c5c00;color:#fff;text-decoration:none;opacity:.92';
     document.body.appendChild(b);
   }
 
