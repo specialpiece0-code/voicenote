@@ -324,6 +324,7 @@ window.__vnDebug = {
     } catch (e) { t('gauth.tokenExpiry', false, String(e)); }
 
     // 15) 요약 품질 모드 → generationConfig (fetch를 가로채 실제 요청 본문 확인)
+    //     3.6: thinkingLevel high/minimal + temperature 부재, 3.5: 기존 thinkingBudget 0 유지
     try {
       const origFetch = window.fetch;
       const bodies = [];
@@ -332,15 +333,45 @@ window.__vnDebug = {
         return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"summary":"s"}' }] } }] }) };
       };
       try {
-        await VN.summarizer.runGemini(fake, 'test-key', VN.summarizer.DEFAULT_MODEL, 'quality');
-        await VN.summarizer.runGemini(fake, 'test-key', VN.summarizer.DEFAULT_MODEL, 'speed');
+        await VN.summarizer.runGemini(fake, 'test-key', 'gemini-3.6-flash', 'quality');
+        await VN.summarizer.runGemini(fake, 'test-key', 'gemini-3.6-flash', 'speed');
+        await VN.summarizer.runGemini(fake, 'test-key', 'gemini-3.5-flash', 'speed');
       } finally { window.fetch = origFetch; }
       const q = bodies[0] && bodies[0].generationConfig;
       const s = bodies[1] && bodies[1].generationConfig;
+      const o = bodies[2] && bodies[2].generationConfig;
       t('summarizer.qualityMode',
-        bodies.length === 2 && q && s && !q.thinkingConfig && s.thinkingConfig && s.thinkingConfig.thinkingBudget === 0,
-        'quality=' + JSON.stringify((q || {}).thinkingConfig || null) + ' speed=' + JSON.stringify((s || {}).thinkingConfig || null));
+        bodies.length === 3 &&
+        q && q.thinkingConfig && q.thinkingConfig.thinkingLevel === 'high' &&
+        !('temperature' in q) && !('thinkingBudget' in q.thinkingConfig) &&
+        q.responseMimeType === 'application/json' &&
+        s && s.thinkingConfig && s.thinkingConfig.thinkingLevel === 'minimal' && !('temperature' in s) &&
+        o && !('thinkingLevel' in (o.thinkingConfig || {})) &&
+        o.thinkingConfig && o.thinkingConfig.thinkingBudget === 0 && o.temperature === 0.3,
+        '3.6q=' + JSON.stringify((q || {}).thinkingConfig || null) +
+        ' 3.6s=' + JSON.stringify((s || {}).thinkingConfig || null) +
+        ' 3.5s=' + JSON.stringify((o || {}).thinkingConfig || null));
     } catch (e) { t('summarizer.qualityMode', false, String(e)); }
+
+    // 15-c) 요약 모델 1회 마이그레이션 — 3.5→3.6 갱신 + 플래그 후 재실행 시 사용자 선택(3.5) 유지
+    try {
+      const prevModel = await VN.db.get('settings', 'geminiModel');
+      const prevFlag = await VN.db.get('settings', 'geminiModelMigratedV36');
+      await VN.db.setSetting('geminiModel', 'gemini-3.5-flash');
+      await VN.db.del('settings', 'geminiModelMigratedV36');
+      await VN.summarizer.migrateModelSetting();
+      const migrated = await VN.db.getSetting('geminiModel', '');
+      const flag = await VN.db.getSetting('geminiModelMigratedV36', false);
+      await VN.db.setSetting('geminiModel', 'gemini-3.5-flash'); // 사용자가 3.5를 다시 선택
+      await VN.summarizer.migrateModelSetting();                 // 플래그가 있어 재변경 없어야 함
+      const kept = await VN.db.getSetting('geminiModel', '');
+      // 원상복구
+      if (prevModel) await VN.db.put('settings', prevModel); else await VN.db.del('settings', 'geminiModel');
+      if (prevFlag) await VN.db.put('settings', prevFlag); else await VN.db.setSetting('geminiModelMigratedV36', true);
+      t('summarizer.modelMigration',
+        migrated === 'gemini-3.6-flash' && flag === true && kept === 'gemini-3.5-flash',
+        'migrated=' + migrated + ' rerunKept=' + kept);
+    } catch (e) { t('summarizer.modelMigration', false, String(e)); }
 
     // 15-b) AI 개인화 컨텍스트 — 저장 시 요약 프롬프트 맨 앞에 포함, 빈 값이면 미포함
     try {
@@ -546,6 +577,7 @@ window.__vnDebug = {
   try {
     await VN.db.open();
     await VN.db.purgeExpiredTrash();   // 30일 지난 휴지통 자동 영구삭제
+    await VN.summarizer.migrateModelSetting();   // 요약 모델 3.6 전환 1회 마이그레이션
   } catch (e) {
     console.error('DB 초기화 실패', e);
   }

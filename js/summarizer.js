@@ -320,11 +320,13 @@ VN.summarizer = (function () {
 
   /* ── Gemini API 고급 모드 ── */
   /* 무료 티어에서 실제로 응답하는 모델만 노출한다.
-     (2.5 계열은 신규 사용자에게 404, pro 계열은 무료 티어 쿼터 0으로 429) */
-  const SUMMARY_MODELS = ['gemini-3.5-flash', 'gemini-flash-latest'];
-  const DEFAULT_MODEL = 'gemini-3.5-flash';
-  /* 오디오 전사는 비용이 커서 요약 모델 선택과 무관하게 flash 고정 */
-  const TRANSCRIBE_MODEL = DEFAULT_MODEL;
+     (2.5 계열은 신규 사용자에게 404, pro 계열은 무료 티어 쿼터 0으로 429)
+     gemini-flash-latest는 별칭 표류(가리키는 실모델이 바뀜) 위험으로 제외. */
+  const SUMMARY_MODELS = ['gemini-3.6-flash', 'gemini-3.5-flash'];
+  const DEFAULT_MODEL = 'gemini-3.6-flash';
+  /* 오디오 전사는 비용이 커서 요약 모델 선택과 무관하게 flash 고정.
+     3.6의 오디오 입력 호환이 검증되기 전까지 3.5 유지. */
+  const TRANSCRIBE_MODEL = 'gemini-3.5-flash';
 
   function pickModel(model) {
     return SUMMARY_MODELS.indexOf(model) !== -1 ? model : DEFAULT_MODEL;
@@ -338,15 +340,47 @@ VN.summarizer = (function () {
     return QUALITY_MODES.indexOf(q) !== -1 ? q : DEFAULT_QUALITY;
   }
 
-  /* quality='quality'  → thinkingConfig를 생략한다. 모델 기본값이 동적 사고이며,
-                          실호출에서 usageMetadata.thoughtsTokenCount > 0으로 확인됨.
-     quality='speed'    → thinkingBudget:0으로 사고를 꺼 응답을 빠르게 한다.
-     pro 계열은 thinking을 끌 수 없어 thinkingBudget:0을 보내면 요청이 거부되므로 제외.
-     quality 미지정(오디오 전사 등)은 기존대로 속도 우선. */
+  /* 모델명에서 세대(예: 3.5, 3.6)를 뽑는다. 못 뽑으면 0. */
+  function modelGeneration(model) {
+    const m = /gemini-(\d+(?:\.\d+)?)/.exec(String(model || ''));
+    return m ? parseFloat(m[1]) : 0;
+  }
+
+  /* 3.6 이상 (실측 검증된 계약):
+       - thinkingConfig.thinkingLevel: 'high'(정확도, 사고 토큰 발생) / 'minimal'(속도, 사고 토큰 0)
+       - 구식 thinkingBudget은 400 거부, temperature 등 샘플링 파라미터는 제거 대상이라 보내지 않는다.
+       - responseMimeType:'application/json'은 thinkingLevel과 호환(200 확인).
+     3.6 미만 (기존 로직 그대로):
+       quality='quality'  → thinkingConfig를 생략한다. 모델 기본값이 동적 사고이며,
+                            실호출에서 usageMetadata.thoughtsTokenCount > 0으로 확인됨.
+       quality='speed'    → thinkingBudget:0으로 사고를 꺼 응답을 빠르게 한다.
+       pro 계열은 thinking을 끌 수 없어 thinkingBudget:0을 보내면 요청이 거부되므로 제외.
+       quality 미지정(오디오 전사 등)은 기존대로 속도 우선. */
   function buildGenerationConfig(model, temperature, quality) {
+    if (modelGeneration(model) >= 3.6) {
+      return {
+        responseMimeType: 'application/json',
+        thinkingConfig: { thinkingLevel: quality === 'quality' ? 'high' : 'minimal' }
+      };
+    }
     const cfg = { responseMimeType: 'application/json', temperature: temperature };
     if (quality !== 'quality' && String(model).indexOf('pro') === -1) cfg.thinkingConfig = { thinkingBudget: 0 };
     return cfg;
+  }
+
+  /* 저장된 요약 모델 설정 1회 마이그레이션 — 3.6 출시에 따라 3.5/flash-latest/빈 값을
+     gemini-3.6-flash로 올린다(사용자 지시). 플래그로 1회만 실행하므로, 이후 사용자가
+     드롭다운에서 3.5를 다시 고르면 그 선택이 그대로 존중된다. init(main.js)에서 호출. */
+  async function migrateModelSetting() {
+    try {
+      const done = await VN.db.getSetting('geminiModelMigratedV36', false);
+      if (done) return;
+      const m = await VN.db.getSetting('geminiModel', '');
+      if (!m || m === 'gemini-3.5-flash' || m === 'gemini-flash-latest') {
+        await VN.db.setSetting('geminiModel', DEFAULT_MODEL);
+      }
+      await VN.db.setSetting('geminiModelMigratedV36', true);
+    } catch (e) { /* 설정 저장 실패는 앱 동작에 치명적이지 않다 */ }
   }
 
   /* ── AI 개인화 컨텍스트 (설정 personaContext) ──
@@ -620,7 +654,7 @@ VN.summarizer = (function () {
     summarize, splitTopics, extractTodos, keywords, tokenize,
     normalizeSummary, normalizeTodos, groupTodosByOwner,
     normalizeMindmap, mindmapLayout,
-    buildGenerationConfig, personaBlock,
+    buildGenerationConfig, migrateModelSetting, personaBlock,
     SUMMARY_MODELS, DEFAULT_MODEL, TRANSCRIBE_MODEL,
     QUALITY_MODES, DEFAULT_QUALITY, pickQuality
   };

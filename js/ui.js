@@ -2421,9 +2421,9 @@ VN.ui = (function () {
       '<button class="btn btn-sm btn-primary" id="st-apikey-save">저장</button>' +
       (apiKey ? '<button class="btn btn-sm" id="st-apikey-del">삭제</button>' : '') + '</div>' +
       '<div class="settings-row"><label>요약 모델</label><select id="st-gemini-model">' +
-      '<option value="gemini-3.5-flash">gemini-3.5-flash — 최상위 모델, 무료</option>' +
-      '<option value="gemini-flash-latest">gemini-flash-latest — 대안, 무료 (최신 flash 자동 추종)</option></select></div>' +
-      '<p class="muted small">gemini-3.5-flash는 현재 Gemini 계열에서 가장 지능적인 최상위 모델입니다(3.5 세대에 pro 변형은 없습니다). ' +
+      '<option value="gemini-3.6-flash">gemini-3.6-flash — 최신, 권장 (무료)</option>' +
+      '<option value="gemini-3.5-flash">gemini-3.5-flash — 이전 기본 (무료)</option></select></div>' +
+      '<p class="muted small">gemini-3.6-flash가 최신 권장 모델입니다. ' +
       '모델 선택은 요약에만 적용되며, 오디오 전사(Gemini 변환)는 비용이 커서 항상 gemini-3.5-flash를 사용합니다.</p>' +
       '<div class="settings-row"><label>요약 품질</label><select id="st-gemini-quality">' +
       '<option value="quality">정확도 우선 (권장, 느림)</option>' +
