@@ -1928,6 +1928,29 @@ VN.ui = (function () {
     };
   }
 
+  /* ── 전사 완료 직후 AI 정리 자동 생성 (설정 autoSummarize, 기본 ON) ──
+     백그라운드로 실행되며 실패해도 전사 결과는 그대로 보존된다(토스트로만 알림).
+     키가 없으면 summarizer.run이 로컬(기본) 모드로 요약한다. */
+  async function autoSummarizeAfter(noteId) {
+    try {
+      const on = await VN.db.getSetting('autoSummarize', true);
+      if (!on) return;
+      const note = await VN.db.getNote(noteId);
+      if (!note || !(note.segments || []).some(s => s.text && s.text.trim())) return;
+      const sum = await VN.summarizer.run(note);
+      // 요약 생성 동안 제목·메모가 편집됐을 수 있으니 최신 노트에 반영한다
+      const fresh = (await VN.db.getNote(noteId).catch(() => null)) || note;
+      fresh.summary = sum;
+      await VN.db.saveNote(fresh);
+      if (sum.fallbackReason) toast('AI 정리 자동 생성(기본 모드 폴백): ' + sum.fallbackReason, 5000);
+      else toast('"' + fresh.title + '" AI 정리를 자동 생성했습니다.');
+      // 같은 노트를 보고 있으면 화면 갱신 (AI 탭에 결과가 바로 보이게)
+      if (S.note && S.note.id === noteId && (location.hash || '').startsWith('#/note/')) await viewNote(noteId);
+    } catch (e) {
+      toast('AI 정리 자동 생성 실패: ' + ((e && e.message) || e) + ' — 노트의 AI 요약 탭에서 수동으로 생성할 수 있습니다.', 5000);
+    }
+  }
+
   /* ── 노트 생성·변환 직후 Drive 자동 저장 (await 없이 백그라운드로 호출됨) ── */
   async function driveAutoSaveAfter(note) {
     try {
@@ -1996,7 +2019,7 @@ VN.ui = (function () {
 
   async function viewSettings() {
     const [lang, theme, apiKey, driveAuto, driveFormat, driveAudio, hookUrl, hookToken, driveLast, folderStatus,
-      clientId, gStatus, apiStatus, driveTarget, dgKey, aaiKey, geminiModel, geminiQuality] = await Promise.all([
+      clientId, gStatus, apiStatus, driveTarget, dgKey, aaiKey, geminiModel, geminiQuality, personaCtx, autoSum] = await Promise.all([
       VN.db.getSetting('defaultLang', 'ko-KR'),
       VN.db.getSetting('theme', 'system'),
       VN.db.getSetting('geminiApiKey', ''),
@@ -2014,7 +2037,9 @@ VN.ui = (function () {
       VN.db.getSetting('deepgramApiKey', ''),
       VN.db.getSetting('assemblyaiApiKey', ''),
       VN.db.getSetting('geminiModel', VN.summarizer.DEFAULT_MODEL),
-      VN.db.getSetting('geminiQuality', VN.summarizer.DEFAULT_QUALITY)
+      VN.db.getSetting('geminiQuality', VN.summarizer.DEFAULT_QUALITY),
+      VN.db.getSetting('personaContext', ''),
+      VN.db.getSetting('autoSummarize', true)
     ]);
     // 사용 통계
     const now = new Date();
@@ -2057,7 +2082,21 @@ VN.ui = (function () {
       '<option value="quality">정확도 우선 (권장, 느림)</option>' +
       '<option value="speed">속도 우선</option></select></div>' +
       '<p class="muted small">정확도 우선은 모델이 내용을 더 깊이 검토해 결정 사항과 담당자를 정확히 뽑아내지만, 요약 생성에 시간이 더 걸립니다. ' +
-      '품질 설정은 요약에만 적용됩니다(오디오 전사는 항상 속도 우선).</p></div>';
+      '품질 설정은 요약에만 적용됩니다(오디오 전사는 항상 속도 우선).</p>' +
+      '<div class="settings-row" style="align-items:flex-start"><label>AI 개인화 컨텍스트</label>' +
+      '<textarea id="st-persona" rows="5" style="flex:1;min-width:200px;resize:vertical" ' +
+      'placeholder="나에 대한 설명을 자유롭게 적어 주세요 (직업, 주 용도, 자주 등장하는 주제, 원하는 요약 스타일 등)">' +
+      U.esc(personaCtx) + '</textarea></div>' +
+      '<div class="settings-row"><label></label>' +
+      '<button class="btn btn-sm btn-primary" id="st-persona-save">저장</button>' +
+      '<button class="btn btn-sm" id="st-persona-example">예시 넣기</button>' +
+      (personaCtx ? '<button class="btn btn-sm" id="st-persona-del">삭제</button>' : '') + '</div>' +
+      '<p class="muted small">AI가 요약·분석할 때 항상 참고하는 나에 대한 설명입니다. ' +
+      'AI 요약(유형 분류·섹션·마인드맵), 오디오 전사(전문 용어 인식), Drive 파일명 주제 생성에 반영됩니다. 이 브라우저에만 저장됩니다.</p>' +
+      '<div class="settings-row"><label>자동 AI 정리</label>' +
+      '<span class="check-row" style="margin:0"><input type="checkbox" id="st-autosum"' + (autoSum ? ' checked' : '') + '>' +
+      '<label for="st-autosum" class="small">변환 완료 후 AI 정리 자동 실행</label></span></div>' +
+      '<p class="muted small">텍스트 변환(업로드·재변환 포함)이 끝나면 AI 정리를 자동으로 생성합니다. 실패해도 변환된 텍스트는 그대로 보존됩니다.</p></div>';
 
     /* ── 자동 화자분리 API 키 ── */
     const keyRow = (id, label, val, ph) =>
@@ -2216,6 +2255,26 @@ VN.ui = (function () {
       toast('API 키를 삭제했습니다.');
       rerender();
     };
+    /* AI 개인화 컨텍스트 — 기본은 빈 값, 저장은 사용자가 직접(자동 강제 주입 없음) */
+    const PERSONA_EXAMPLE = '나는 장례지도사이자 상담심리학을 공부하는 전문가다. ' +
+      '장거리 이동 중 길고 두서없이 떠오르는 생각을 음성으로 기록하는 경우가 많다. ' +
+      '고인을 가족처럼 대하는 마음, 유가족들의 얽힌 심리적 구조, 누군가를 깊이 배려하기 위한 복잡한 절차들이 기록에 자주 등장한다. ' +
+      '요약은 전문 상담 일지나 서비스 기획 노트처럼 논리적이고 정돈된 형태로 작성해 달라.';
+    $('#st-persona-save').onclick = async () => {
+      await VN.db.setSetting('personaContext', $('#st-persona').value.trim());
+      toast('AI 개인화 컨텍스트를 저장했습니다.');
+      rerender();
+    };
+    $('#st-persona-example').onclick = () => {
+      $('#st-persona').value = PERSONA_EXAMPLE;
+      toast('예시를 채웠습니다. 내용을 다듬은 뒤 "저장"을 눌러 주세요.');
+    };
+    if ($('#st-persona-del')) $('#st-persona-del').onclick = async () => {
+      await VN.db.setSetting('personaContext', '');
+      toast('AI 개인화 컨텍스트를 삭제했습니다.');
+      rerender();
+    };
+    $('#st-autosum').onchange = (e) => VN.db.setSetting('autoSummarize', e.target.checked);
     VN.db.setSetting('apiKey', ''); // 이전 버전의 API 키 설정값 정리
     /* 키 입력칸에서 Enter 로도 저장되게 (버튼을 못 찾는 경우가 많아 추가) */
     [['#st-apikey', '#st-apikey-save'], ['#ga-clientid', '#ga-clientid-save'],
@@ -2414,15 +2473,24 @@ VN.ui = (function () {
       }
     });
 
-    // 자동 전사 진행 알림: 완료 토스트 + 보고 있는 화면 갱신 + Drive 자동 저장(변환 완료 후 1회)
+    // 자동 전사 진행 알림: 완료 토스트 + 보고 있는 화면 갱신 + AI 정리 자동 생성 + Drive 자동 저장(변환 완료 후 1회)
     VN.transcribe.setListener(async (note, phase) => {
       if (phase === 'done') toast('"' + note.title + '" 텍스트 변환 완료 (' + (note.segments || []).length + '개 구간)');
       else if (phase === 'error' || phase === 'blocked') toast(note.transcribeError || '텍스트 변환에 실패했습니다.', 5000);
       const hash = location.hash || '#/list';
       if (S.note && S.note.id === note.id && hash.startsWith('#/note/')) await viewNote(note.id);
       else if (hash === '' || hash === '#' || hash.startsWith('#/list') || hash.startsWith('#/fav') || hash.startsWith('#/folder')) await route();
-      // Drive 자동 저장은 변환이 끝난 뒤 1회 — 실패해도 오디오·메모는 저장되게 error에서도 실행
-      if (phase === 'done' || phase === 'error') driveAutoSaveAfter(note);
+      // 변환 성공 → (설정 시) AI 정리 자동 생성 → Drive 자동 저장 1회.
+      // 요약을 먼저 만들어야 Drive 문서에 AI 정리가 담기고 파일명 주제도 좋아진다.
+      // 요약이 실패해도 전사 결과는 보존되고 Drive 저장은 그대로 진행된다.
+      // (변환 실패 시에는 요약 없이 바로 저장 — 오디오·메모라도 남긴다)
+      if (phase === 'done' || phase === 'error') {
+        (async () => {
+          if (phase === 'done') await autoSummarizeAfter(note.id);
+          const fresh = await VN.db.getNote(note.id).catch(() => null);
+          driveAutoSaveAfter(fresh || note);
+        })();
+      }
     });
     // 지난 세션에서 끊긴 변환(pending 노트) 자동 재개 — "창을 닫아도 됨"의 웹 구현
     VN.transcribe.resumePending().then(n => {

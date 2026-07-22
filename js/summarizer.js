@@ -349,6 +349,21 @@ VN.summarizer = (function () {
     return cfg;
   }
 
+  /* ── AI 개인화 컨텍스트 (설정 personaContext) ──
+     비어 있지 않으면 프롬프트 맨 앞에 "사용자 배경: …" 블록으로 주입한다.
+     주입 지점: 적응형 요약(runGemini)·오디오 전사(transcribeAudioGemini)·
+     Drive 주제 생성(drive.generateTopic). 로컬(오프라인) 요약에는 주입할 곳이 없다. */
+  function personaBlock(persona, usage) {
+    persona = String(persona == null ? '' : persona).trim();
+    if (!persona) return '';
+    return '사용자 배경(' + (usage || '항상 참고') + '):\n' + persona + '\n\n';
+  }
+
+  async function getPersona() {
+    try { return String(await VN.db.getSetting('personaContext', '') || '').trim(); }
+    catch (e) { return ''; }
+  }
+
   /* 전사 → 프롬프트용 텍스트·참석자 목록 (요약·Ask AI 공용) */
   function noteTranscript(note) {
     const segs = (note.segments || []).filter(s => s.text && s.text.trim());
@@ -405,8 +420,10 @@ VN.summarizer = (function () {
     if (!ctx.segs.length) throw new Error('요약할 텍스트가 없습니다.');
 
     /* 적응형 요약: 회의 고정 스키마 대신, 모델이 먼저 대화 유형을 분류하고
-       유형에 맞는 섹션을 스스로 구성한다. */
-    const prompt = '다음은 음성 녹음의 전사 텍스트입니다. 먼저 대화 유형을 분류하고' +
+       유형에 맞는 섹션을 스스로 구성한다.
+       개인화 컨텍스트가 있으면 유형 분류·섹션 구성·마인드맵 모두 이 배경을 반영한다. */
+    const prompt = personaBlock(await getPersona(), '유형 분류·섹션 구성·마인드맵·요약 작성 시 항상 반영하세요') +
+      '다음은 음성 녹음의 전사 텍스트입니다. 먼저 대화 유형을 분류하고' +
       '(회의/강의·수업/통화/인터뷰/상담/일상대화/발표/기타 중 하나), 유형에 맞게 정리해 아래 JSON 형식으로만 답하세요(다른 텍스트 금지).\n' +
       '{"type":"유형","summary":"핵심 요약 3~5문장",' +
       '"sections":[{"title":"섹션명","items":["항목"]}],' +
@@ -511,7 +528,9 @@ VN.summarizer = (function () {
     }
     const b64 = await VN.util.blobToBase64(blob);
     const langLabel = { 'ko-KR': '한국어', 'en-US': '영어', 'ja-JP': '일본어', 'zh-CN': '중국어' }[opts.language] || '들리는 언어';
-    const prompt = '첨부된 오디오 전체를 ' + langLabel + '로 전사하세요. ' +
+    /* 개인화 컨텍스트 — 도메인 전문 용어(장례·상담 등)를 올바르게 받아 적는 힌트 */
+    const prompt = personaBlock(await getPersona(), '전문 용어·고유명사를 올바르게 받아 적는 힌트로만 사용하세요') +
+      '첨부된 오디오 전체를 ' + langLabel + '로 전사하세요. ' +
       '각 발화를 {"start": 발화 시작 시각(초, number), "speaker": "참석자1"|"참석자2"|… (목소리로 화자 추정), "text": "발화 내용"} ' +
       '객체로 하는 JSON 배열만 출력하세요. 다른 텍스트 금지. 무음 구간은 건너뛰세요. ' +
       'text는 문장 단위로 끊어 한 객체에 한두 문장만 담으세요.';
@@ -601,7 +620,7 @@ VN.summarizer = (function () {
     summarize, splitTopics, extractTodos, keywords, tokenize,
     normalizeSummary, normalizeTodos, groupTodosByOwner,
     normalizeMindmap, mindmapLayout,
-    buildGenerationConfig,
+    buildGenerationConfig, personaBlock,
     SUMMARY_MODELS, DEFAULT_MODEL, TRANSCRIBE_MODEL,
     QUALITY_MODES, DEFAULT_QUALITY, pickQuality
   };

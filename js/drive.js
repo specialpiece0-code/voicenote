@@ -262,7 +262,10 @@ VN.drive = (function () {
       try {
         const head = (note.segments || []).slice(0, 40).map(s => s.text).join(' ').slice(0, 4000);
         const sum = (note.summary && note.summary.summary) || '';
-        const prompt = '다음 회의 내용의 핵심 주제를 한국어 15자 이내의 명사구 하나로만 답하세요. 따옴표·마침표·설명 금지.\n\n' +
+        /* AI 개인화 컨텍스트 — 주제 명명에 사용자 배경(도메인) 반영 */
+        const persona = String(await VN.db.getSetting('personaContext', '') || '').trim();
+        const prompt = VN.summarizer.personaBlock(persona, '주제 명명에 참고하세요') +
+          '다음 회의 내용의 핵심 주제를 한국어 15자 이내의 명사구 하나로만 답하세요. 따옴표·마침표·설명 금지.\n\n' +
           (sum ? '[요약]\n' + sum + '\n\n' : '') + '[대화 앞부분]\n' + head;
         // 요약과 동일한 사고 설정(speed)을 재사용하되, 이 호출은 일반 텍스트 응답이므로 JSON 강제는 해제
         const genCfg = VN.summarizer.buildGenerationConfig(model, 0.3, 'speed');

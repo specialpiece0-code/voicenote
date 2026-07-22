@@ -342,6 +342,35 @@ window.__vnDebug = {
         'quality=' + JSON.stringify((q || {}).thinkingConfig || null) + ' speed=' + JSON.stringify((s || {}).thinkingConfig || null));
     } catch (e) { t('summarizer.qualityMode', false, String(e)); }
 
+    // 15-b) AI 개인화 컨텍스트 — 저장 시 요약 프롬프트 맨 앞에 포함, 빈 값이면 미포함
+    try {
+      const prevPersona = await VN.db.getSetting('personaContext', '');
+      const origFetch = window.fetch;
+      const bodies = [];
+      window.fetch = async (url, opts) => {
+        bodies.push(JSON.parse(opts.body));
+        return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"summary":"s"}' }] } }] }) };
+      };
+      try {
+        await VN.db.setSetting('personaContext', '__vntest 장례지도사·상담 전문가 페르소나');
+        await VN.summarizer.runGemini(fake, 'test-key', VN.summarizer.DEFAULT_MODEL, 'speed');
+        await VN.db.setSetting('personaContext', '');
+        await VN.summarizer.runGemini(fake, 'test-key', VN.summarizer.DEFAULT_MODEL, 'speed');
+      } finally {
+        window.fetch = origFetch;
+        await VN.db.setSetting('personaContext', prevPersona);
+      }
+      const p1 = ((bodies[0] || {}).contents || [{}])[0].parts[0].text;
+      const p2 = ((bodies[1] || {}).contents || [{}])[0].parts[0].text;
+      t('summarizer.personaContext',
+        bodies.length === 2 &&
+        p1.indexOf('사용자 배경') === 0 && p1.indexOf('__vntest 장례지도사·상담 전문가 페르소나') !== -1 &&
+        p2.indexOf('사용자 배경') === -1 && p2.indexOf('__vntest') === -1 &&
+        VN.summarizer.personaBlock('') === '' && VN.summarizer.personaBlock('  ') === '' &&
+        VN.summarizer.personaBlock('X', '힌트').indexOf('사용자 배경(힌트):\nX') === 0,
+        'with=' + (p1.indexOf('__vntest') !== -1) + ' without=' + (p2.indexOf('__vntest') === -1));
+    } catch (e) { t('summarizer.personaContext', false, String(e)); }
+
     // 16) 로컬 주제/키워드 — 연결어미로 끝나는 토큰("했는지", "모르겠으나" 등) 제외
     try {
       const n2 = VN.db.newNote({
