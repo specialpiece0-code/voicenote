@@ -5,13 +5,22 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <meta name="theme-color" content="#03C75A">
   <title>보이스노트</title>
+  <script>/* 다크 FOUC 방지 — 저장된 테마를 CSS 로드 전에 적용 (ui.js applyTheme가 localStorage.vnTheme에 미러) */
+    try { document.documentElement.dataset.theme = localStorage.getItem('vnTheme') || ''; } catch (e) { }
+  </script>
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="icon" href="icon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
   <div id="app">
-    <main id="main"><!-- ui.js 렌더링 --></main>
+    <main id="main"><!-- ui.js 렌더링 (아래는 첫 페인트용 정적 스켈레톤) -->
+      <div class="boot-skeleton" aria-hidden="true">
+        <div class="skel" style="height:86px"></div>
+        <div class="skel" style="height:86px"></div>
+        <div class="skel" style="height:86px"></div>
+      </div>
+    </main>
   </div>
   <nav id="bottom-nav" aria-label="주 메뉴">
     <button id="nav-search" class="nav-btn" aria-label="검색">🔍<span>검색</span></button>

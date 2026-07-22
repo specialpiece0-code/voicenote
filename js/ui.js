@@ -16,6 +16,8 @@ VN.ui = (function () {
     segFilter: 'all',          // all | bookmark | highlight
     segSpeaker: null,          // null(전체) | 화자 인덱스 — 화자 필터 칩
     noteSearch: { q: '', matches: [], cur: -1 },
+    noteSearchOpen: false,     // 노트 내 검색 바 표시 여부 (기본 숨김)
+    noteReplOpen: false,       // 검색 바 안 "바꾸기" 2차 토글
     pendingJump: null,         // 전역 검색 → 노트 열 때 점프할 검색어
     editingSeg: null,
     rec: null,                 // 녹음 세션 상태
@@ -96,12 +98,38 @@ VN.ui = (function () {
     return isMobileUA(navigator.userAgent, navigator.maxTouchPoints);
   }
 
-  async function refresh() {
+  /* 노트·폴더 목록 메모리 캐시 — 저장 시점(invalidateNotesCache)에 무효화되고,
+     외부 계층의 직접 DB 쓰기를 놓쳐도 1.5초 뒤엔 자동으로 다시 읽는다. */
+  let notesCacheAt = 0;
+  function invalidateNotesCache() { notesCacheAt = 0; }
+  async function refresh(force) {
+    if (!force && Date.now() - notesCacheAt < 1500) return;
     S.notes = await VN.db.getAllNotes();
     S.folders = await VN.db.getFolders();
+    notesCacheAt = Date.now();
   }
 
-  async function saveNote(note) { await VN.db.saveNote(note); }
+  async function saveNote(note) { await VN.db.saveNote(note); invalidateNotesCache(); }
+
+  /* 편집 중 여부 — 백그라운드 완료(전사·요약)로 화면을 통째로 다시 그리면 입력이 증발하므로 가드 */
+  function isEditingDom() {
+    const ae = document.activeElement;
+    return !!(ae && (ae.isContentEditable || ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA'));
+  }
+
+  /* 노트 상세 인라인 파이프라인 배너 — 해당 노트를 보고 있을 때만 갱신, 성공 시 true */
+  function setNotePipe(noteId, html) {
+    if (!S.note || S.note.id !== noteId || !(location.hash || '').startsWith('#/note/')) return false;
+    const el = $('#note-pipe');
+    if (!el) return false;
+    el.innerHTML = html ? '<div class="banner info">' + html + '</div>' : '';
+    return true;
+  }
+
+  /* 카드 키보드 접근 (홈·검색 공용): Enter/Space로 열기 */
+  function cardKeydown(open) {
+    return (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } };
+  }
 
   /* ── 전역 검색 (순수 함수: 셀프테스트에서 사용) ── */
   function searchNotes(notes, q) {
@@ -180,7 +208,7 @@ VN.ui = (function () {
   function notifyAuthExpired() {
     if (authExpiredBanner && authExpiredBanner.isConnected) return;
     authExpiredBanner = showTopBanner('Google 로그인이 만료되었습니다 — 설정에서 다시 로그인해 주세요.', [
-      { label: '설정으로 이동', primary: true, onClick: () => go('#/settings') }
+      { label: '설정으로 이동', primary: true, onClick: () => { try { sessionStorage.setItem('advFocus', 'google'); } catch (e) { } go('#/settings/advanced'); } }
     ]);
   }
 
@@ -274,21 +302,26 @@ VN.ui = (function () {
   /* ══════════════ 라우팅 ══════════════ */
 
   async function route() {
+    // 녹음 중 이탈(뒤로가기 등) → 확인 게이트: 취소하면 녹음 화면으로 복귀
+    if (S.rec && S.rec.active && !location.hash.startsWith('#/record')) {
+      const ok = await confirmModal('녹음 진행 중',
+        '녹음을 종료하고 저장할까요?<br><span class="muted small">취소하면 녹음 화면으로 돌아가 계속 녹음합니다.</span>',
+        '종료하고 저장');
+      if (!ok) { location.hash = '#/record'; return; } // 재진입은 resuming 경로 — 세션 유지
+      const saved = await finishRecording(true);       // Drive 업로드는 내부에서 백그라운드 진행
+      if (saved) toast('진행 중이던 녹음을 저장했습니다.');
+    }
     // 플레이어 정리 (objectURL 누수 방지)
     if (S.player) { S.player.destroy(); S.player = null; }
-    // 녹음 중 이탈 → 자동 저장 (Drive 업로드는 finishRecording 안에서 백그라운드 진행)
-    if (S.rec && S.rec.active && !location.hash.startsWith('#/record')) {
-      const ok = await finishRecording(true);
-      if (ok) toast('진행 중이던 녹음을 저장했습니다.');
-    }
     const hash = location.hash || '#/list';
     const parts = hash.slice(2).split('/');
+    if (parts[0] !== 'record') document.body.classList.remove('on-record');
     await refresh();
     updateNav(hash);
 
     if (parts[0] === 'note' && parts[1]) await viewNote(parts[1]);
     else if (parts[0] === 'record') viewRecord();
-    else if (parts[0] === 'settings') await viewSettings();
+    else if (parts[0] === 'settings') await (parts[1] === 'advanced' ? viewSettingsAdvanced() : viewSettings());
     else if (parts[0] === 'trash') await viewTrash();
     else if (parts[0] === 'search') viewSearch();
     else if (parts[0] === 'folder' && parts[1]) viewList({ folderId: parts[1] });
@@ -348,6 +381,7 @@ VN.ui = (function () {
     const name = await promptModal('새 폴더', '폴더 이름', '');
     if (!name) return;
     await VN.db.saveFolder({ name });
+    invalidateNotesCache();
     toast('폴더를 만들었습니다.');
     route();
   }
@@ -366,12 +400,14 @@ VN.ui = (function () {
       if (!name) return;
       folder.name = name;
       await VN.db.saveFolder(folder);
+      invalidateNotesCache();
       route();
     };
     $('#fo-del', m).onclick = async () => {
       m.remove();
       if (await confirmModal('폴더 삭제', '폴더를 삭제하면 안의 노트는 전체 노트로 이동합니다.', '삭제', true)) {
         await VN.db.deleteFolder(folder.id);
+        invalidateNotesCache();
         go('#/list');
       }
     };
@@ -402,7 +438,7 @@ VN.ui = (function () {
       S.folders.map(f =>
         '<button class="filter-chip' + (isOn('#/folder/' + f.id) ? ' on' : '') + '" data-go="#/folder/' + f.id +
         '" data-folder="' + f.id + '">📁 ' + U.esc(f.name) +
-        (isOn('#/folder/' + f.id) ? '<span class="chip-more">⋯</span>' : '') + '</button>').join('') +
+        '<span class="chip-more">⋯</span></button>').join('') +
       '<button class="filter-chip" id="chip-add-folder" aria-label="폴더 추가">＋ 폴더</button>';
 
     main().innerHTML =
@@ -456,13 +492,24 @@ VN.ui = (function () {
               : '노트가 없습니다.<br>첫 녹음을 시작해 보세요.') +
           '<div class="empty-actions">' +
           '<button class="btn btn-primary" id="empty-rec">● 첫 녹음 시작</button>' +
-          '<button class="btn btn-outline" id="empty-import">파일 불러오기</button></div></div>';
+          '<button class="btn btn-outline" id="empty-import">파일 불러오기</button>' +
+          '<button class="btn btn-outline" id="empty-demo">데모 노트로 둘러보기</button></div></div>';
         $('#empty-rec').onclick = () => go('#/record');
         $('#empty-import').onclick = () => $('#file-input').click();
+        $('#empty-demo').onclick = async (e) => {
+          e.target.disabled = true;
+          try {
+            const note = await VN.demo.seedDemo();
+            invalidateNotesCache();
+            go('#/note/' + note.id);
+          } catch (err) { toast('데모 생성 실패: ' + ((err && err.message) || err)); e.target.disabled = false; }
+        };
         return;
       }
       list.innerHTML = results.map(n => {
-        const preview = n.transcribePending ? '⏳ 텍스트 변환 중…' : U.esc(noteText(n).slice(0, 90) || '(전사 없음)');
+        const preview = n.transcribePending
+          ? '<span class="pulse-soft">⏳ 텍스트 변환 중…</span>'
+          : U.esc(noteText(n).slice(0, 90) || '(아직 텍스트가 없어요)');
         const fname = n.folderId ? (S.folders.find(f => f.id === n.folderId) || {}).name : null;
         return '<div class="note-card" data-id="' + n.id + '" role="button" tabindex="0">' +
           '<div class="nc-title">' + U.esc(n.title || '제목 없음') + '</div>' +
@@ -477,7 +524,7 @@ VN.ui = (function () {
       $$('.note-card', list).forEach(c => {
         const open = () => go('#/note/' + c.dataset.id);
         c.onclick = (e) => { if (e.target.closest('.nc-star')) return; open(); };
-        c.onkeydown = (e) => { if (e.key === 'Enter') open(); };
+        c.onkeydown = cardKeydown(open);
       });
       $$('.nc-star', list).forEach(b => b.onclick = async (e) => {
         e.stopPropagation();
@@ -504,12 +551,34 @@ VN.ui = (function () {
       '<div class="view under-1"><div id="sr-results"></div></div>';
     $('#sr-back').onclick = () => go('#/list');
 
+    const cardHtml = (n, q, snippet) =>
+      '<div class="note-card" data-id="' + n.id + '" role="button" tabindex="0">' +
+      '<div class="nc-title">' + markText(n.title || '제목 없음', q) + '</div>' +
+      (snippet ? '<div class="search-snippet">' + markText(snippet, q) + '</div>' : '') +
+      '<div class="nc-meta"><span>' + U.fmtDate(n.createdAt) + '</span><span>⏱ ' + U.fmtTime(n.duration) + '</span></div>' +
+      '</div>';
+    const bindCards = (box, jumpQ) => {
+      $$('.note-card', box).forEach(c => {
+        const open = () => {
+          if (jumpQ) S.pendingJump = jumpQ;
+          go('#/note/' + c.dataset.id);
+        };
+        c.onclick = open;
+        c.onkeydown = cardKeydown(open);
+      });
+    };
     const renderResults = () => {
       const q = S.listQuery.trim();
       const box = $('#sr-results');
       if (!box) return;
       if (!q) {
-        box.innerHTML = '<div class="empty-state"><div class="big">🔍</div>노트 제목·본문·메모에서 검색합니다.</div>';
+        // 빈 검색어: 최근 노트 3개로 바로 진입할 수 있게
+        const recent = S.notes.slice().sort((a, b) => b.createdAt - a.createdAt).slice(0, 3);
+        box.innerHTML = recent.length
+          ? '<div class="muted small" style="margin-bottom:8px">최근 노트</div>' +
+            recent.map(n => cardHtml(n, '', null)).join('')
+          : '<div class="empty-state"><div class="big">🔍</div>노트 제목·본문·메모에서 검색합니다.</div>';
+        bindCards(box, null);
         return;
       }
       const results = searchNotes(sortNotes(S.notes), q);
@@ -517,16 +586,9 @@ VN.ui = (function () {
         box.innerHTML = '<div class="empty-state"><div class="big">🔍</div>"' + U.esc(q) + '" 검색 결과가 없습니다.</div>';
         return;
       }
-      box.innerHTML = results.map(({ note: n, snippet }) =>
-        '<div class="note-card" data-id="' + n.id + '" role="button" tabindex="0">' +
-        '<div class="nc-title">' + markText(n.title || '제목 없음', q) + '</div>' +
-        (snippet ? '<div class="search-snippet">' + markText(snippet, q) + '</div>' : '') +
-        '<div class="nc-meta"><span>' + U.fmtDate(n.createdAt) + '</span><span>⏱ ' + U.fmtTime(n.duration) + '</span></div>' +
-        '</div>').join('');
-      $$('.note-card', box).forEach(c => c.onclick = () => {
-        S.pendingJump = S.listQuery.trim();
-        go('#/note/' + c.dataset.id);
-      });
+      box.innerHTML = '<div class="muted small" style="margin-bottom:8px">노트 ' + results.length + '개</div>' +
+        results.map(({ note: n, snippet }) => cardHtml(n, q, snippet)).join('');
+      bindCards(box, q);
     };
     renderResults();
     const input = $('#sr-q');
@@ -547,6 +609,8 @@ VN.ui = (function () {
     S.segFilter = 'all';
     S.segSpeaker = null;
     S.noteSearch = { q: '', matches: [], cur: -1 };
+    S.noteSearchOpen = false;
+    S.noteReplOpen = false;
     S.editingSeg = null;
 
     const hasAudio = note.audioBlob instanceof Blob;
@@ -576,6 +640,10 @@ VN.ui = (function () {
         ? '<span><a href="' + U.esc(note.driveLink) + '" target="_blank" rel="noopener">Drive에서 열기 ↗</a></span>' : '') +
       '</div>' +
       (hasAudio ? '' : '<div class="banner info">이 노트에는 오디오가 없습니다.</div>') +
+      /* 백그라운드 파이프라인(변환→AI 정리→Drive) 인라인 상태 — 토스트 대신 여기서 갱신 */
+      '<div id="note-pipe">' +
+      (note.transcribePending ? '<div class="banner info">⏳ 자동 텍스트 변환 중 — 화면을 이동해도 계속됩니다.</div>' : '') +
+      '</div>' +
       '<div id="tab-body"></div></div>';
 
     /* 하단 고정 플레이어 바 (내비 위) — 스크롤 중에도 항상 조작 가능 */
@@ -606,6 +674,8 @@ VN.ui = (function () {
       S.player = VN.player.create(audioEl, note, {
         onTime: (t) => {
           $('#pl-time') && ($('#pl-time').textContent = U.fmtTime(t) + ' / ' + U.fmtTime(S.player.duration));
+          const mb = $('#memo-t-badge');
+          if (mb) mb.textContent = '⏱ ' + U.fmtTime(t);
           syncCurrentSegment(t);
         },
         onEnded: () => { const b = $('#pl-toggle'); if (b) b.textContent = '▶'; }
@@ -621,11 +691,12 @@ VN.ui = (function () {
       $('#pl-fwd10').onclick = () => S.player.skip(10);
       $('#pl-speed').onclick = () => { $('#pl-speed').textContent = S.player.cycleSpeed().toFixed(2).replace(/0$/, '') + '×'; };
       $('#pl-ab').onclick = () => {
+        // 토스트 없이 버튼 라벨·상태로만 피드백 (A-? → A-B 켜짐 → 해제)
         const st = S.player.toggleAB();
         const b = $('#pl-ab');
-        if (st === 'A') { b.textContent = 'A-?'; b.classList.add('on'); toast('반복 시작 지점(A)을 설정했습니다.'); }
-        else if (st === 'B') { b.textContent = 'A-B'; b.classList.add('on'); toast('A-B 구간 반복을 시작합니다.'); }
-        else { b.textContent = 'A-B'; b.classList.remove('on'); toast('구간 반복을 해제했습니다.'); }
+        if (st === 'A') { b.textContent = 'A-?'; b.classList.add('on'); }
+        else if (st === 'B') { b.textContent = 'A-B'; b.classList.add('on'); }
+        else { b.textContent = 'A-B'; b.classList.remove('on'); }
       };
     }
 
@@ -638,10 +709,11 @@ VN.ui = (function () {
     });
     renderTabBody(note);
 
-    // 전역 검색에서 온 점프
+    // 전역 검색에서 온 점프 — 노트 내 검색 바 자동 열기
     if (S.pendingJump) {
       const q = S.pendingJump; S.pendingJump = null;
       S.noteSearch.q = q;
+      S.noteSearchOpen = true;
       renderTabBody(note);
       setTimeout(() => jumpToMatch(0), 100);
     }
@@ -656,7 +728,6 @@ VN.ui = (function () {
         onClick: async () => {
           note.favorite = !note.favorite;
           await saveNote(note);
-          toast(note.favorite ? '즐겨찾기에 추가했습니다.' : '즐겨찾기를 해제했습니다.');
         }
       },
       { icon: '↗', label: '공유', onClick: () => shareModal(note) },
@@ -696,6 +767,7 @@ VN.ui = (function () {
     if (await confirmModal('노트 삭제', '휴지통으로 이동합니다. 30일 후 자동으로 영구 삭제됩니다.', '삭제', true)) {
       if (S.player) { S.player.destroy(); S.player = null; }
       await VN.db.trashNote(note.id);
+      invalidateNotesCache();
       toast('휴지통으로 이동했습니다.');
       go('#/list');
     }
@@ -788,7 +860,6 @@ VN.ui = (function () {
       await saveNote(note);
       m.remove();
       renderTabBody(note);
-      toast('참석자 정보를 저장했습니다.');
     };
   }
 
@@ -811,10 +882,8 @@ VN.ui = (function () {
   function renderSegTab(note) {
     const body = $('#tab-body');
     let html = '';
-    // 자동 변환 인라인 상태 — 진행 모달 없이 여기서만 알린다
-    if (note.transcribePending) {
-      html += '<div class="banner info">⏳ 자동 텍스트 변환 중 — 화면을 이동해도 계속됩니다.</div>';
-    } else if (note.transcribeError) {
+    // 자동 변환 진행 배너는 탭 공통 영역(#note-pipe)에서 표시 — 여기서는 오류·재시도만
+    if (note.transcribeError) {
       html += '<div class="banner">' + U.esc(note.transcribeError) +
         ' <button class="btn btn-sm btn-primary" id="btn-tr-retry" style="margin-left:8px">다시 시도</button></div>';
     }
@@ -824,23 +893,31 @@ VN.ui = (function () {
       '<button class="filter-chip' + (S.segSpeaker === i ? ' on' : '') + '" data-sp-f="' + i + '">' +
       '<span class="sp-dot" style="background:' + speakerColor(i) + '"></span>' + U.esc(speakerName(note, i)) + '</button>'
     ).join('') : '';
+    /* 검색·바꾸기 바는 기본 숨김 — 🔍 토글로 열고, "바꾸기"는 그 안의 2차 토글 */
+    const searchOpen = S.noteSearchOpen || !!S.noteSearch.q.trim();
     html += '<div class="seg-toolbar">' +
       '<button class="filter-chip' + (S.segFilter === 'all' ? ' on' : '') + '" data-f="all">전체</button>' +
       '<button class="filter-chip' + (S.segFilter === 'bookmark' ? ' on' : '') + '" data-f="bookmark">🔖 북마크만</button>' +
       '<button class="filter-chip' + (S.segFilter === 'highlight' ? ' on' : '') + '" data-f="highlight">🖍 하이라이트만</button>' +
       spChips +
       '<div class="spacer" style="flex:1"></div>' +
+      '<button class="icon-btn' + (searchOpen ? ' on' : '') + '" id="btn-ns-toggle" aria-label="노트 내 검색" aria-expanded="' + searchOpen + '">🔍</button>' +
       '<button class="btn btn-sm btn-outline" id="btn-speakers-edit" aria-label="참석자 이름 변경·병합">👥 참석자</button>' +
       '<button class="btn btn-sm btn-outline" id="btn-add-seg">＋ 구간 추가</button>' +
-      '</div>' +
-      '<div class="note-search-bar">' +
-      '<input type="search" id="ns-q" placeholder="노트 내 검색" value="' + U.esc(S.noteSearch.q) + '">' +
-      '<button class="icon-btn" id="ns-prev" title="이전">↑</button>' +
-      '<button class="icon-btn" id="ns-next" title="다음">↓</button>' +
-      '<span class="match-info" id="ns-info"></span>' +
-      '<input type="text" id="ns-repl" placeholder="바꿀 내용">' +
-      '<button class="btn btn-sm" id="ns-replace">한 번에 바꾸기</button>' +
       '</div>';
+    if (searchOpen) {
+      html += '<div class="note-search-bar">' +
+        '<input type="search" id="ns-q" placeholder="노트 내 검색" value="' + U.esc(S.noteSearch.q) + '">' +
+        '<button class="icon-btn" id="ns-prev" title="이전">↑</button>' +
+        '<button class="icon-btn" id="ns-next" title="다음">↓</button>' +
+        '<span class="match-info" id="ns-info"></span>' +
+        '<button class="btn btn-sm' + (S.noteReplOpen ? ' btn-outline' : '') + '" id="ns-repl-toggle">바꾸기</button>' +
+        (S.noteReplOpen
+          ? '<input type="text" id="ns-repl" placeholder="바꿀 내용">' +
+            '<button class="btn btn-sm" id="ns-replace">한 번에 바꾸기</button>'
+          : '') +
+        '</div>';
+    }
 
     // 녹음 중 찍은 시점 북마크 칩
     if ((note.bookmarks || []).length) {
@@ -855,7 +932,10 @@ VN.ui = (function () {
 
     if ($('#btn-tr-retry')) $('#btn-tr-retry').onclick = async () => {
       const r = await VN.transcribe.start(note);
-      if (!r.started && r.reason === 'no-keys') go('#/settings');
+      if (!r.started && r.reason === 'no-keys') {
+        try { sessionStorage.setItem('advFocus', 'gemini'); } catch (e) { }
+        go('#/settings/advanced');
+      }
     };
 
     $$('.filter-chip[data-f]', body).forEach(c => c.onclick = () => { S.segFilter = c.dataset.f; renderSegTab(note); });
@@ -878,31 +958,47 @@ VN.ui = (function () {
       if (idx >= 0) startEditSegment(note, idx);
     };
 
-    const doSearch = () => {
-      const q = $('#ns-q').value;
-      S.noteSearch.q = q;
-      S.noteSearch.matches = [];
-      if (q.trim()) {
-        note.segments.forEach((s, i) => {
-          if ((s.text || '').toLowerCase().includes(q.trim().toLowerCase())) S.noteSearch.matches.push(i);
-        });
-      }
-      S.noteSearch.cur = S.noteSearch.matches.length ? 0 : -1;
-      renderSegList(note);
-      updateMatchInfo();
+    /* 🔍 토글 — 닫으면 검색 상태도 초기화 */
+    $('#btn-ns-toggle').onclick = () => {
+      const nowOpen = !(S.noteSearchOpen || !!S.noteSearch.q.trim());
+      S.noteSearchOpen = nowOpen;
+      if (!nowOpen) { S.noteSearch = { q: '', matches: [], cur: -1 }; S.noteReplOpen = false; }
+      renderSegTab(note);
+      if (nowOpen) { const i = $('#ns-q'); if (i) i.focus(); }
     };
-    $('#ns-q').oninput = U.debounce(doSearch, 250);
-    $('#ns-prev').onclick = () => jumpToMatch(-1);
-    $('#ns-next').onclick = () => jumpToMatch(1);
-    $('#ns-replace').onclick = async () => {
-      const find = $('#ns-q').value.trim();
-      const repl = $('#ns-repl').value;
-      if (!find) { toast('바꿀 검색어를 입력하세요.'); return; }
-      const n = replaceInNote(note, find, repl);
-      if (n > 0) { await saveNote(note); toast(n + '건을 바꿨습니다.'); doSearch(); }
-      else toast('일치하는 내용이 없습니다.');
-    };
-    if (S.noteSearch.q) doSearch();
+
+    if (searchOpen) {
+      const doSearch = () => {
+        const q = $('#ns-q').value;
+        S.noteSearch.q = q;
+        S.noteSearch.matches = [];
+        if (q.trim()) {
+          note.segments.forEach((s, i) => {
+            if ((s.text || '').toLowerCase().includes(q.trim().toLowerCase())) S.noteSearch.matches.push(i);
+          });
+        }
+        S.noteSearch.cur = S.noteSearch.matches.length ? 0 : -1;
+        renderSegList(note);
+        updateMatchInfo();
+      };
+      $('#ns-q').oninput = U.debounce(doSearch, 250);
+      $('#ns-prev').onclick = () => jumpToMatch(-1);
+      $('#ns-next').onclick = () => jumpToMatch(1);
+      $('#ns-repl-toggle').onclick = () => {
+        S.noteReplOpen = !S.noteReplOpen;
+        S.noteSearchOpen = true;
+        renderSegTab(note);
+      };
+      if ($('#ns-replace')) $('#ns-replace').onclick = async () => {
+        const find = $('#ns-q').value.trim();
+        const repl = $('#ns-repl').value;
+        if (!find) { toast('바꿀 검색어를 입력하세요.'); return; }
+        const n = replaceInNote(note, find, repl);
+        if (n > 0) { await saveNote(note); toast(n + '건을 바꿨습니다.'); doSearch(); }
+        else toast('일치하는 내용이 없습니다.');
+      };
+      if (S.noteSearch.q) doSearch();
+    }
   }
 
   function updateMatchInfo() {
@@ -934,10 +1030,11 @@ VN.ui = (function () {
     const segs = visibleSegments(note);
     if (!segs.length) {
       list.innerHTML = '<div class="empty-state">표시할 내용이 없습니다.' +
-        (S.segFilter !== 'all' ? '<br><span class="small">필터를 해제해 보세요.</span>' : '<br><span class="small">"구간 추가"로 직접 전사를 입력할 수 있습니다.</span>') + '</div>';
+        (S.segFilter !== 'all' ? '<br><span class="small">필터를 해제해 보세요.</span>' : '<br><span class="small">"구간 추가"를 눌러 내용을 직접 적을 수 있어요.</span>') + '</div>';
       return;
     }
     const q = S.noteSearch.q.trim();
+    /* 상시 버튼은 북마크·하이라이트 2개 — 편집은 텍스트 탭, 편집·삭제는 롱프레스 메뉴 */
     list.innerHTML = segs.map(({ s, i }) => {
       const name = speakerName(note, s.speaker);
       return '<div class="segment' + (s.highlighted ? ' hl' : '') + '" data-seg-idx="' + i + '">' +
@@ -948,14 +1045,19 @@ VN.ui = (function () {
         '<span class="seg-actions">' +
         '<button data-act="bm" class="' + (s.bookmarked ? 'on' : '') + '" title="북마크">' + (s.bookmarked ? '🔖' : '📑') + '</button>' +
         '<button data-act="hl" class="' + (s.highlighted ? 'on' : '') + '" title="하이라이트">🖍</button>' +
-        '<button data-act="edit" title="편집">✎</button>' +
-        '<button data-act="del" title="삭제">🗑</button>' +
         '</span></div>' +
-        '<div class="seg-text" data-text-idx="' + i + '">' + (q ? markText(s.text || '', q) : U.esc(s.text || '')) + '</div>' +
+        '<div class="seg-text" data-text-idx="' + i + '" title="탭하여 편집">' + (q ? markText(s.text || '', q) : U.esc(s.text || '')) + '</div>' +
         '</div></div>';
     }).join('');
 
     $$('.seg-time', list).forEach(el => el.onclick = () => { if (S.player) S.player.playFrom(+el.dataset.t); });
+    const deleteSeg = async (i) => {
+      if (await confirmModal('구간 삭제', '이 구간을 삭제할까요?', '삭제', true)) {
+        note.segments.splice(i, 1);
+        await saveNote(note);
+        renderSegTab(note);
+      }
+    };
     $$('.segment', list).forEach(row => {
       const i = +row.dataset.segIdx;
       const s = note.segments[i];
@@ -964,15 +1066,28 @@ VN.ui = (function () {
         const act = b.dataset.act;
         if (act === 'bm') { s.bookmarked = !s.bookmarked; await saveNote(note); renderSegList(note); }
         else if (act === 'hl') { s.highlighted = !s.highlighted; await saveNote(note); renderSegList(note); }
-        else if (act === 'edit') startEditSegment(note, i);
-        else if (act === 'del') {
-          if (await confirmModal('구간 삭제', '이 구간을 삭제할까요?', '삭제', true)) {
-            note.segments.splice(i, 1);
-            await saveNote(note);
-            renderSegTab(note);
-          }
-        }
       });
+      // 텍스트 탭 → 바로 편집
+      const textEl = $('.seg-text', row);
+      if (textEl) textEl.onclick = () => { if (!textEl.isContentEditable) startEditSegment(note, i); };
+      // 롱프레스(550ms) → 편집·삭제 메뉴 (스크롤 이동 시 취소)
+      let lpTimer = null, lpX = 0, lpY = 0;
+      row.addEventListener('pointerdown', (e) => {
+        if (e.target.closest('button')) return;
+        lpX = e.clientX; lpY = e.clientY;
+        lpTimer = setTimeout(() => {
+          lpTimer = null;
+          menuPop(row, [
+            { icon: '✎', label: '편집', onClick: () => startEditSegment(note, i) },
+            { icon: '🗑', label: '삭제', danger: true, onClick: () => deleteSeg(i) }
+          ]);
+        }, 550);
+      });
+      row.addEventListener('pointermove', (e) => {
+        if (lpTimer && (Math.abs(e.clientX - lpX) > 10 || Math.abs(e.clientY - lpY) > 10)) { clearTimeout(lpTimer); lpTimer = null; }
+      });
+      ['pointerup', 'pointerleave', 'pointercancel'].forEach(ev =>
+        row.addEventListener(ev, () => { if (lpTimer) { clearTimeout(lpTimer); lpTimer = null; } }));
     });
   }
 
@@ -995,8 +1110,12 @@ VN.ui = (function () {
     el.onkeydown = (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); el.blur(); } };
   }
 
-  /* 재생 동기: 현재 세그먼트 하이라이트 + 자동 스크롤 */
+  /* 재생 동기: 현재 세그먼트 하이라이트 + 자동 스크롤
+     — 사용자가 직접 스크롤한 뒤 4초간은 자동 스크롤을 멈춘다 (하이라이트는 유지) */
   let lastCurrentIdx = -1;
+  let userScrolledAt = 0;
+  window.addEventListener('wheel', () => { userScrolledAt = Date.now(); }, { passive: true });
+  window.addEventListener('touchmove', () => { userScrolledAt = Date.now(); }, { passive: true });
   function syncCurrentSegment(t) {
     if (S.noteTab !== 'seg' || !S.note) return;
     const segs = S.note.segments || [];
@@ -1011,7 +1130,7 @@ VN.ui = (function () {
       const el = $('[data-seg-idx="' + cur + '"]');
       if (el) {
         el.classList.add('current');
-        el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        if (Date.now() - userScrolledAt > 4000) el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
       }
     }
   }
@@ -1020,8 +1139,9 @@ VN.ui = (function () {
   function renderMemoTab(note) {
     const body = $('#tab-body');
     const curT = S.player ? S.player.currentTime : 0;
-    let html = '<div class="record-memo-row" style="margin-bottom:14px">' +
-      '<input type="text" id="memo-new" placeholder="메모 입력 후 Enter (현재 재생 시점 기준으로 기록)">' +
+    let html = '<div class="record-memo-row" style="margin-bottom:14px;align-items:center">' +
+      '<span class="tag" id="memo-t-badge" title="현재 재생 시점">⏱ ' + U.fmtTime(curT) + '</span>' +
+      '<input type="text" id="memo-new" placeholder="이 시점에 메모 남기기">' +
       '<button class="btn btn-primary btn-sm" id="memo-add">추가</button></div>' +
       '<div id="memo-list"></div>';
     body.innerHTML = html;
@@ -1117,7 +1237,7 @@ VN.ui = (function () {
             '<div class="ask-item"><div class="ask-q">Q. ' + U.esc(it.q) + '</div>' +
             '<div class="ask-a">' + U.esc(it.a) + '</div>' +
             '<div class="faint small" style="margin-top:4px">' + U.fmtDate(it.at) + '</div></div>').join('')
-        : '<p class="muted small">전사 전체(+메모)를 근거로 Gemini에게 질문합니다. 질문·답변은 이 노트에 저장됩니다.</p>';
+        : '<p class="muted small">이 녹음의 전체 내용과 메모를 바탕으로 AI가 답합니다. 질문·답변은 이 노트에 저장됩니다.</p>';
     };
     renderAskHistory();
     const sendAsk = async () => {
@@ -1135,7 +1255,7 @@ VN.ui = (function () {
         if ($('#ask-q')) $('#ask-q').value = '';
         renderAskHistory();
       } catch (e) {
-        if (e && e.code === 'no-key') toast('Gemini API 키가 필요합니다 — 설정 → 고급 모드(Gemini)에서 등록하세요.', 5000);
+        if (e && e.code === 'no-key') toast('Gemini API 키가 필요합니다 — 설정 → 고급 설정의 AI 요약 엔진 (Gemini)에서 등록하세요.', 5000);
         else toast('답변 실패: ' + ((e && e.message) || e));
       }
       const b = $('#ask-send');
@@ -1148,7 +1268,7 @@ VN.ui = (function () {
       VN.db.getSetting('geminiModel', VN.summarizer.DEFAULT_MODEL)
     ]).then(([k, m]) => {
       const label = VN.summarizer.SUMMARY_MODELS.indexOf(m) !== -1 ? m : VN.summarizer.DEFAULT_MODEL;
-      $('#ai-mode-info') && ($('#ai-mode-info').textContent = k ? '고급 모드(' + label + ') (실패 시 기본 모드 폴백)' : '기본 모드 (오프라인 추출 요약)');
+      $('#ai-mode-info') && ($('#ai-mode-info').textContent = k ? '고급 모드(' + label + ') (실패 시 기본 모드 폴백)' : '기본 모드 — 인터넷 없이 만드는 간단 요약');
     });
 
     const renderResult = () => {
@@ -1265,6 +1385,12 @@ VN.ui = (function () {
       if (!(note.segments || []).some(x => x.text && x.text.trim())) { toast('요약할 전사 텍스트가 없습니다.'); return; }
       const btn = $('#btn-ai-run');
       btn.disabled = true; btn.textContent = '생성 중…';
+      // 생성 중 스켈레톤 — 빈 화면 대신 자리 표시
+      const resBox = $('#ai-result');
+      if (resBox) resBox.innerHTML =
+        '<div class="skel" style="height:96px;margin-bottom:10px"></div>' +
+        '<div class="skel" style="height:72px;margin-bottom:10px"></div>' +
+        '<div class="skel" style="height:72px"></div>';
       try {
         note.summary = await VN.summarizer.run(note, (n, total) => {
           const b = $('#btn-ai-run');
@@ -1280,6 +1406,7 @@ VN.ui = (function () {
         }
       } catch (e) {
         toast('생성 실패: ' + (e.message || e));
+        renderResult(); // 실패 시 스켈레톤 제거 후 기존 상태 복원
       }
       const b = $('#btn-ai-run');
       if (b) { b.disabled = false; b.textContent = 'AI 정리 다시 생성'; }
@@ -1345,7 +1472,7 @@ VN.ui = (function () {
       '<div class="check-row"><input type="checkbox" id="ex-sp" checked><label for="ex-sp">화자 이름 포함</label></div>' +
       '<div class="check-row"><input type="checkbox" id="ex-time" checked><label for="ex-time">시각 포함</label></div>' +
       '<div class="check-row"><input type="checkbox" id="ex-memo" checked><label for="ex-memo">메모 포함</label></div>' +
-      '<div class="check-row hidden" id="ex-audio-row"><input type="checkbox" id="ex-audio"><label for="ex-audio">오디오 포함 (base64)</label></div>' +
+      '<div class="check-row hidden" id="ex-audio-row"><input type="checkbox" id="ex-audio"><label for="ex-audio">오디오 포함 (파일이 커집니다)</label></div>' +
       '</div></div>' +
       '<div class="modal-actions"><button class="btn" data-x="no">취소</button><button class="btn btn-primary" id="ex-go">다운로드</button></div>');
     $('[data-x="no"]', m).onclick = () => m.remove();
@@ -1386,12 +1513,13 @@ VN.ui = (function () {
     // 실시간 자막을 끄고 녹음 종료 후 사후 전사를 안내한다.
     const mobile = isMobile();
     const MOBILE_NOTICE = '모바일에서는 실시간 자막이 지원되지 않습니다. 녹음을 마치면 자동으로 텍스트 변환이 시작됩니다.';
-    /* 상단 고정 앱바: ←(취소·확인 모달) + 제목 + 화면 켜짐 유지 토글 */
+    // 녹음 화면 동안 하단 내비 숨김 (오탭 이탈 차단) — route()가 다른 화면 진입 시 제거
+    document.body.classList.add('on-record');
+    /* 상단 고정 앱바: ←(취소·확인 모달) + 제목 + 화면 켜짐 유지 토글(☀ 아이콘 버튼) */
     let html = '<div class="topbar"><div class="topbar-row">' +
       '<button class="icon-btn plain" id="rec-back" aria-label="녹음 취소·뒤로">←</button>' +
       '<h1 class="bar-title">녹음</h1><div class="spacer"></div>' +
-      '<span class="check-row" id="rec-wl-row" style="margin:0"><input type="checkbox" id="rec-wakelock">' +
-      '<label for="rec-wakelock" class="small">화면 켜짐 유지</label></span>' +
+      '<button class="icon-btn" id="rec-wakelock-btn" aria-pressed="false" aria-label="화면 켜짐 유지" title="화면 켜짐 유지">☀</button>' +
       '</div></div>';
     html += '<div class="view under-1 record-wrap">';
     if (!recSupported) {
@@ -1400,19 +1528,21 @@ VN.ui = (function () {
     if (!sttSupported && !mobile) {
       html += '<div class="banner">이 브라우저는 음성인식(SpeechRecognition)을 지원하지 않아 자막 없이 녹음만 진행됩니다. (Chrome/Edge 권장)</div>';
     }
+    /* 언어는 상태 줄 옆 텍스트 버튼(menuPop) — 숨은 select가 값의 원본 */
     html += '<div id="rec-cal"></div>' +
-      '<div class="settings-row" style="justify-content:center"><label for="rec-lang">인식 언어</label>' +
-      '<select id="rec-lang" aria-label="인식 언어" style="flex:0 1 auto">' +
+      '<select id="rec-lang" aria-label="인식 언어" hidden>' +
       '<option value="ko-KR">한국어</option><option value="en-US">영어 (미국)</option>' +
-      '<option value="ja-JP">일본어</option><option value="zh-CN">중국어 (간체)</option></select></div>' +
+      '<option value="ja-JP">일본어</option><option value="zh-CN">중국어 (간체)</option></select>' +
       '<div class="record-timer" id="rec-timer">00:00</div>' +
-      '<div class="record-state" id="rec-state">녹음 대기 중</div>' +
+      '<div class="record-state-row"><span id="rec-state">녹음 대기 중</span>' +
+      '<button class="rec-lang-btn" id="rec-lang-btn" aria-label="인식 언어 선택">한국어 ▾</button></div>' +
       '<canvas id="record-wave" width="640" height="90"></canvas>' +
-      '<div class="speaker-tabs" id="rec-speakers"></div>' +
+      (mobile ? '' : '<div class="speaker-tabs" id="rec-speakers"></div>') +
       '<div id="rec-warn"></div>' +
-      '<div class="stt-live" id="stt-live"><span class="faint">' +
-      (mobile ? MOBILE_NOTICE : '녹음을 시작하면 실시간 자막이 여기에 표시됩니다.') + '</span></div>' +
-      '<div class="record-memo-row">' +
+      (mobile
+        ? '<div class="banner info" style="margin-top:12px">' + MOBILE_NOTICE + '</div>'
+        : '<div class="stt-live" id="stt-live"><span class="faint">녹음을 시작하면 실시간 자막이 여기에 표시됩니다.</span></div>') +
+      '<div class="record-memo-row"' + (mobile ? ' style="margin-top:4px"' : '') + '>' +
       '<button class="icon-btn" id="rec-bookmark" aria-label="현재 시점 북마크" disabled>🔖</button>' +
       '<input type="text" id="rec-memo" placeholder="📝 타임스탬프 메모 입력 후 Enter" aria-label="타임스탬프 메모" disabled>' +
       '</div>' +
@@ -1420,6 +1550,22 @@ VN.ui = (function () {
       '<button class="btn btn-primary btn-rec-start" id="rec-start"' + (recSupported ? '' : ' disabled') + '>● 녹음 시작</button>' +
       '</div></div>';
     main().innerHTML = html;
+
+    /* 언어 버튼 ↔ 숨은 select 동기화 */
+    const syncLangBtn = () => {
+      const sel = $('#rec-lang'), b = $('#rec-lang-btn');
+      if (!sel || !b) return;
+      b.textContent = (LANG_LABEL[sel.value] || sel.value) + ' ▾';
+      b.disabled = sel.disabled;
+    };
+    $('#rec-lang-btn').onclick = (e) => {
+      const sel = $('#rec-lang');
+      if (!sel || sel.disabled) return;
+      menuPop(e.currentTarget, ['ko-KR', 'en-US', 'ja-JP', 'zh-CN'].map(v => ({
+        label: LANG_LABEL[v] || v, checked: sel.value === v,
+        onClick: () => { sel.value = v; syncLangBtn(); }
+      })));
+    };
 
     /* ← : 녹음 중이면 확인 모달 후 취소, 아니면 목록으로 */
     $('#rec-back').onclick = async () => {
@@ -1437,16 +1583,24 @@ VN.ui = (function () {
       } else go('#/list');
     };
 
-    if (!resuming) VN.db.getSetting('defaultLang', 'ko-KR').then(l => { $('#rec-lang') && ($('#rec-lang').value = l); });
+    if (!resuming) VN.db.getSetting('defaultLang', 'ko-KR').then(l => {
+      const sel = $('#rec-lang');
+      if (sel) { sel.value = l; syncLangBtn(); }
+    });
+    syncLangBtn();
 
-    // Wake Lock 옵션 (미지원 브라우저는 숨김)
+    // Wake Lock 옵션 — ☀ 아이콘 토글 (미지원 브라우저는 숨김)
     if (!('wakeLock' in navigator)) {
-      $('#rec-wl-row').classList.add('hidden');
+      $('#rec-wakelock-btn').classList.add('hidden');
     } else {
-      VN.db.getSetting('wakeLock', false).then(v => { const c = $('#rec-wakelock'); if (c) c.checked = !!v; });
-      $('#rec-wakelock').onchange = (e) => {
-        VN.db.setSetting('wakeLock', e.target.checked);
-        if (S.rec && S.rec.active) { if (e.target.checked) acquireWakeLock(); else releaseWakeLock(); }
+      const wlBtn = $('#rec-wakelock-btn');
+      const setWl = (on) => { wlBtn.classList.toggle('on', on); wlBtn.setAttribute('aria-pressed', on ? 'true' : 'false'); };
+      VN.db.getSetting('wakeLock', false).then(v => { if (wlBtn.isConnected) setWl(!!v); });
+      wlBtn.onclick = () => {
+        const on = !wlBtn.classList.contains('on');
+        setWl(on);
+        VN.db.setSetting('wakeLock', on);
+        if (S.rec && S.rec.active) { if (on) acquireWakeLock(); else releaseWakeLock(); }
       };
     }
 
@@ -1609,10 +1763,13 @@ VN.ui = (function () {
       S.rec.active = true;
       S.rec.sttWarned = false;
       updateNav();
-      if ($('#rec-wakelock') && $('#rec-wakelock').checked) acquireWakeLock();
-      live().innerHTML = mobile ? '<span class="faint">' + MOBILE_NOTICE + '</span>' : '';
+      const wlBtn2 = $('#rec-wakelock-btn');
+      if (wlBtn2 && wlBtn2.classList.contains('on')) acquireWakeLock();
+      const liveBox = live();
+      if (liveBox) liveBox.innerHTML = '';
       interimEl = null;
       $('#rec-lang').disabled = true;
+      syncLangBtn();
       $('#rec-bookmark').disabled = false;
       $('#rec-memo').disabled = false;
       $('#rec-state').innerHTML = '<span class="rec-dot"></span>녹음 중';
@@ -1651,10 +1808,11 @@ VN.ui = (function () {
     if (resuming) {
       const langSel = $('#rec-lang');
       if (langSel) { langSel.value = S.rec.lang; langSel.disabled = true; }
+      syncLangBtn();
       $('#rec-bookmark').disabled = false;
       $('#rec-memo').disabled = false;
       const box = live();
-      if (box) box.innerHTML = mobile ? '<span class="faint">' + MOBILE_NOTICE + '</span>' : '';
+      if (box) box.innerHTML = '';
       interimEl = null;
       for (const seg of S.rec.segments) renderFinalDom(seg);
       const paused = VN.recorder.state === 'paused';
@@ -1706,6 +1864,7 @@ VN.ui = (function () {
       waveform: result.waveform
     });
     await VN.db.saveNote(note);
+    invalidateNotesCache();
     // 노트가 안전하게 저장됐으니 크래시 세이프 청크 정리
     try { await VN.db.clear('recChunks'); } catch (e) { /* ignore */ }
     S.rec = null;
@@ -1719,7 +1878,7 @@ VN.ui = (function () {
       transcribing = await VN.transcribe.start(note);
     }
     if (!silent) {
-      toast('노트가 생성되었습니다.');
+      // 토스트 없이 노트 상세로 전환 — 화면 이동 자체가 저장 피드백, 진행 상태는 인라인 배너로
       go('#/note/' + note.id);
     }
     // Drive 자동 저장: 변환을 시작했으면 완료·실패 후 1회(transcribe 리스너에서 실행 —
@@ -1799,7 +1958,8 @@ VN.ui = (function () {
     }
     // 선택 모달 없이 자동으로 텍스트 변환 시작 (키가 없으면 노트에 안내가 남는다)
     for (const n of notes) await VN.transcribe.start(n);
-    await refresh();
+    invalidateNotesCache();
+    await refresh(true);
     if (notes.length === 1) {
       go('#/note/' + notes[0].id);
     } else {
@@ -1819,7 +1979,7 @@ VN.ui = (function () {
        ['deepgram', 'Deepgram (자동 화자분리)'],
        ['assemblyai', 'AssemblyAI (자동 화자분리)'],
        ['gemini', 'Gemini'],
-       ['whisper', 'Whisper (브라우저 내 처리 · 느림)'],
+       ['whisper', 'Whisper — 인터넷 없이 이 기기에서 처리 (느림)'],
        ['manual', '✎ 수동 입력 (구간 직접 추가)']].map(o =>
         '<button class="btn btn-block" style="margin-bottom:8px;justify-content:flex-start" data-eng="' + o[0] + '">' + o[1] + '</button>').join('') +
       '</div><div class="modal-actions"><button class="btn" data-x="no">취소</button></div>');
@@ -1843,8 +2003,13 @@ VN.ui = (function () {
     }
     if (engine === 'auto') {
       const r = await VN.transcribe.start(note);
-      if (!r.started && r.reason === 'no-keys') go('#/settings');
-      else if (r.started) renderTabBody(note);   // pending 배너 표시
+      if (!r.started && r.reason === 'no-keys') {
+        try { sessionStorage.setItem('advFocus', 'gemini'); } catch (e) { }
+        go('#/settings/advanced');
+      } else if (r.started) {
+        setNotePipe(note.id, '⏳ 자동 텍스트 변환 중 — 화면을 이동해도 계속됩니다.');
+        renderTabBody(note);
+      }
       return;
     }
     // 개별 엔진 — 진행 표시와 함께 직접 실행
@@ -1937,15 +2102,19 @@ VN.ui = (function () {
       if (!on) return;
       const note = await VN.db.getNote(noteId);
       if (!note || !(note.segments || []).some(s => s.text && s.text.trim())) return;
+      setNotePipe(noteId, '🤖 AI 정리 생성 중…');
       const sum = await VN.summarizer.run(note);
       // 요약 생성 동안 제목·메모가 편집됐을 수 있으니 최신 노트에 반영한다
       const fresh = (await VN.db.getNote(noteId).catch(() => null)) || note;
       fresh.summary = sum;
       await VN.db.saveNote(fresh);
-      if (sum.fallbackReason) toast('AI 정리 자동 생성(기본 모드 폴백): ' + sum.fallbackReason, 5000);
-      else toast('"' + fresh.title + '" AI 정리를 자동 생성했습니다.');
-      // 같은 노트를 보고 있으면 화면 갱신 (AI 탭에 결과가 바로 보이게)
-      if (S.note && S.note.id === noteId && (location.hash || '').startsWith('#/note/')) await viewNote(noteId);
+      invalidateNotesCache();
+      // 같은 노트를 보고 있으면 인라인 갱신, 노트 밖에서는 토스트 없이 조용히 (완료 토스트는 변환 단계 1개만)
+      if (S.note && S.note.id === noteId && (location.hash || '').startsWith('#/note/')) {
+        if (isEditingDom()) toast('처리가 끝났습니다. 편집을 마치면 새로 고쳐집니다.');
+        else await viewNote(noteId);
+        if (sum.fallbackReason) setNotePipe(noteId, '⚠️ AI 정리는 기본 모드로 생성됨 — ' + U.esc(sum.fallbackReason));
+      }
     } catch (e) {
       toast('AI 정리 자동 생성 실패: ' + ((e && e.message) || e) + ' — 노트의 AI 요약 탭에서 수동으로 생성할 수 있습니다.', 5000);
     }
@@ -1963,8 +2132,15 @@ VN.ui = (function () {
         const ti = $('#note-title');
         if (ti) ti.value = note.title;
       }
-      if (r && r.saved) toast('Drive 저장됨: ' + (r.filename || ''));
-      else if (r && !r.skipped && r.message) toast(r.message);
+      if (r && r.saved) {
+        // 노트를 보고 있으면 인라인 배너로만, 노트 밖에서는 토스트 없이 조용히
+        if (setNotePipe(note.id, '☁ Drive 저장됨 ✓ ' + U.esc(r.filename || ''))) {
+          setTimeout(() => setNotePipe(note.id, ''), 4000);
+        }
+      } else {
+        setNotePipe(note.id, '');
+        if (r && !r.skipped && r.message) toast(r.message);
+      }
       if (r && r.authExpired) notifyAuthExpired();
       return r;
     } catch (e) { toast('Drive 자동 저장 실패: ' + (e.message || e)); }
@@ -1992,12 +2168,13 @@ VN.ui = (function () {
     list.innerHTML = items.map(n => {
       const daysLeft = Math.max(0, Math.ceil((VN.db.TRASH_KEEP_MS - (Date.now() - n.deletedAt)) / 86400000));
       return '<div class="trash-item"><div><div class="t-title">' + U.esc(n.title) + '</div>' +
-        '<div class="t-meta">삭제: ' + U.fmtDate(n.deletedAt) + ' · ' + daysLeft + '일 후 영구 삭제</div></div>' +
+        '<div class="t-meta">⏱ ' + U.fmtTime(n.duration || 0) + ' · 삭제: ' + U.fmtDate(n.deletedAt) + ' · ' + daysLeft + '일 후 영구 삭제</div></div>' +
         '<div class="t-actions"><button class="btn btn-sm" data-restore="' + n.id + '">복원</button>' +
         '<button class="btn btn-sm btn-danger" data-purge="' + n.id + '">영구 삭제</button></div></div>';
     }).join('');
     $$('[data-restore]', list).forEach(b => b.onclick = async () => {
       await VN.db.restoreNote(b.dataset.restore);
+      invalidateNotesCache();
       toast('복원했습니다.');
       route();
     });
@@ -2015,31 +2192,24 @@ VN.ui = (function () {
     };
   }
 
-  /* ══════════════ 설정 ══════════════ */
+  /* ══════════════ 설정 (2계층: 메인 = 일상 / 고급 = 기술) ══════════════ */
 
+  const TARGET_LABEL = { folder: 'PC 폴더', api: 'Drive API', webhook: 'Apps Script 웹훅', none: '사용 안 함' };
+
+  /* ── 설정 메인 (#/settings) — 일상 설정만. 기술 항목은 고급 설정으로 분리 ── */
   async function viewSettings() {
-    const [lang, theme, apiKey, driveAuto, driveFormat, driveAudio, hookUrl, hookToken, driveLast, folderStatus,
-      clientId, gStatus, apiStatus, driveTarget, dgKey, aaiKey, geminiModel, geminiQuality, personaCtx, autoSum] = await Promise.all([
+    // 일상 설정 5개 + 연동 상태 뱃지용 로컬 값만 읽는다 (네트워크·권한 조회는 고급 화면에서만)
+    const [lang, theme, autoSum, driveAuto, personaCtx, apiKey, dgKey, aaiKey, driveTarget, gStatus] = await Promise.all([
       VN.db.getSetting('defaultLang', 'ko-KR'),
       VN.db.getSetting('theme', 'system'),
-      VN.db.getSetting('geminiApiKey', ''),
+      VN.db.getSetting('autoSummarize', true),
       VN.db.getSetting('driveAutoSave', true),
-      VN.db.getSetting('driveFormat', 'doc'),
-      VN.db.getSetting('driveAudio', false),
-      VN.db.getSetting('appsScriptUrl', ''),
-      VN.db.getSetting('appsScriptToken', ''),
-      VN.drive.getLastResult(),
-      VN.drive.getFolderStatus(),
-      VN.gauth.getClientId(),
-      VN.gauth.status(),
-      VN.drive.getApiStatus(),
-      VN.drive.getTarget(),
+      VN.db.getSetting('personaContext', ''),
+      VN.db.getSetting('geminiApiKey', ''),
       VN.db.getSetting('deepgramApiKey', ''),
       VN.db.getSetting('assemblyaiApiKey', ''),
-      VN.db.getSetting('geminiModel', VN.summarizer.DEFAULT_MODEL),
-      VN.db.getSetting('geminiQuality', VN.summarizer.DEFAULT_QUALITY),
-      VN.db.getSetting('personaContext', ''),
-      VN.db.getSetting('autoSummarize', true)
+      VN.drive.getTarget(),
+      VN.gauth.status()
     ]);
     // 사용 통계
     const now = new Date();
@@ -2060,14 +2230,191 @@ VN.ui = (function () {
       '<div class="stat-card"><div class="val">' + S.notes.length + '</div><div class="lbl">전체 노트 수</div></div>' +
       '</div><div class="muted small" style="margin-top:8px" id="st-storage"></div></div>';
 
-    html += '<div class="settings-group"><h2>일반</h2>' +
+    html += '<div class="settings-group"><h2>기본</h2>' +
+      '<div class="settings-row"><label>테마</label><select id="st-theme">' +
+      '<option value="system">시스템 설정 따름</option><option value="light">라이트</option><option value="dark">다크</option></select></div>' +
       '<div class="settings-row"><label>기본 인식 언어</label><select id="st-lang">' +
       '<option value="ko-KR">한국어</option><option value="en-US">영어 (미국)</option>' +
       '<option value="ja-JP">일본어</option><option value="zh-CN">중국어 (간체)</option></select></div>' +
-      '<div class="settings-row"><label>테마</label><select id="st-theme">' +
-      '<option value="system">시스템 설정 따름</option><option value="light">라이트</option><option value="dark">다크</option></select></div></div>';
+      '<div class="settings-row"><label>자동 AI 정리</label>' +
+      '<span class="check-row" style="margin:0"><input type="checkbox" id="st-autosum"' + (autoSum ? ' checked' : '') + '>' +
+      '<label for="st-autosum" class="small">변환 완료 후 AI 정리 자동 실행</label></span></div>' +
+      '<div class="settings-row"><label>Drive 자동 저장</label>' +
+      '<span class="check-row" style="margin:0"><input type="checkbox" id="dr-auto"' + (driveAuto ? ' checked' : '') + '>' +
+      '<label for="dr-auto" class="small">녹음·변환 직후 자동 저장</label></span></div>' +
+      '<p class="muted small">저장 경로: ' + (TARGET_LABEL[driveTarget] || driveTarget) + ' — 경로·형식 변경은 고급 설정에서.</p></div>';
 
-    html += '<div class="settings-group"><h2>고급 모드(Gemini)</h2>' +
+    html += '<div class="settings-group"><h2>AI 개인화</h2>' +
+      '<div class="settings-row" style="align-items:flex-start"><label>나에 대한 설명</label>' +
+      '<textarea id="st-persona" rows="5" style="flex:1;min-width:200px;resize:vertical" ' +
+      'placeholder="나에 대한 설명을 자유롭게 적어 주세요 (직업, 주 용도, 자주 등장하는 주제, 원하는 요약 스타일 등)">' +
+      U.esc(personaCtx) + '</textarea></div>' +
+      '<div class="settings-row"><label></label>' +
+      '<button class="btn btn-sm btn-primary" id="st-persona-save">저장</button>' +
+      '<button class="btn btn-sm" id="st-persona-example">예시 넣기</button>' +
+      (personaCtx ? '<button class="btn btn-sm" id="st-persona-del">삭제</button>' : '') + '</div>' +
+      '<p class="muted small">AI가 요약·분석할 때 항상 참고하는 나에 대한 설명입니다. ' +
+      'AI 요약(유형 분류·섹션·마인드맵), 오디오 전사(전문 용어 인식), Drive 파일명 주제 생성에 반영됩니다. 이 기기의 브라우저에만 저장됩니다.</p></div>';
+
+    /* 연동 상태 요약 카드 — 상세 설정은 [관리]로 고급 설정에 진입 */
+    const connBadge = (ok, offLabel) => ok
+      ? '<span class="conn-badge">연동됨 ✅</span>'
+      : '<span class="conn-badge off">' + (offLabel || '미설정') + '</span>';
+    html += '<div class="settings-group"><h2>연동 상태</h2>' +
+      '<div class="conn-row"><span class="conn-name">AI 요약</span>' + connBadge(!!apiKey) +
+      '<button class="btn btn-sm btn-outline" data-adv="gemini">관리</button></div>' +
+      '<div class="conn-row"><span class="conn-name">화자분리</span>' + connBadge(!!(dgKey || aaiKey)) +
+      '<button class="btn btn-sm btn-outline" data-adv="diarize">관리</button></div>' +
+      '<div class="conn-row"><span class="conn-name">Google 계정</span>' +
+      connBadge(gStatus.signedIn, gStatus.configured ? '로그인 안 됨' : '미설정') +
+      '<button class="btn btn-sm btn-outline" data-adv="google">관리</button></div>' +
+      '<div class="conn-row"><span class="conn-name">저장 경로</span>' +
+      (driveTarget !== 'none'
+        ? '<span class="conn-badge">' + U.esc(TARGET_LABEL[driveTarget] || driveTarget) + '</span>'
+        : '<span class="conn-badge off">미설정</span>') +
+      '<button class="btn btn-sm btn-outline" data-adv="drive">관리</button></div></div>';
+
+    html += '<div class="settings-group"><h2>데이터</h2>' +
+      '<div class="settings-row"><label>전체 백업</label>' +
+      '<span class="check-row" style="margin:0"><input type="checkbox" id="st-bk-audio" checked><label for="st-bk-audio" class="small">오디오 포함 (파일이 커집니다)</label></span>' +
+      '<button class="btn btn-sm" id="st-backup">백업 파일 다운로드</button></div>' +
+      '<div class="settings-row"><label>복원 (가져오기)</label><button class="btn btn-sm" id="st-restore">백업 파일 선택</button></div>' +
+      '<div class="settings-row"><label>휴지통</label><button class="btn btn-sm" id="st-trash">휴지통 열기</button></div>' +
+      '<div class="settings-row"><label>전체 삭제</label><button class="btn btn-sm btn-danger" id="st-wipe">모든 데이터 삭제</button></div>' +
+      '<p class="muted small">클라우드 동기화 대신 백업 파일로 다른 기기에 옮길 수 있습니다.</p></div>';
+
+    html += '<div class="settings-group">' +
+      '<button class="link-row" id="st-adv">⚙️ 고급 설정 <span class="muted small">AI 키 · Google 계정 · Drive 상세</span><span class="lr-arrow">›</span></button></div>';
+
+    html += '<div class="settings-group"><h2>도움말</h2><div class="muted small" style="line-height:1.8">' +
+      '· 마이크 녹음과 실시간 음성인식은 Chrome/Edge + localhost(또는 HTTPS)에서만 동작합니다.<br>' +
+      '· 실시간 음성인식(SpeechRecognition)은 브라우저가 제공하는 온라인 서비스라 인터넷 연결이 필요합니다.<br>' +
+      '· Firefox는 음성인식을 지원하지 않아 녹음만 가능합니다. 녹음을 마치면 자동 텍스트 변환이 시작됩니다.<br>' +
+      '· 모든 데이터는 이 기기의 브라우저에만 저장됩니다. 기기를 바꾸거나 브라우저 데이터를 지우면 사라지니 주기적으로 백업해 주세요.</div></div>';
+
+    html += '</div>';
+    main().innerHTML = html;
+
+    /* 저장 후 재렌더 — 스크롤 위치 유지, 설정 메인이 열려 있을 때만 */
+    const rerender = () => {
+      if (location.hash.startsWith('#/settings') && !location.hash.includes('advanced')) {
+        const y = window.scrollY;
+        viewSettings().then(() => window.scrollTo(0, y));
+      }
+    };
+
+    $('#st-back').onclick = () => go('#/list');
+    $('#st-adv').onclick = () => go('#/settings/advanced');
+    $$('[data-adv]').forEach(b => b.onclick = () => {
+      try { sessionStorage.setItem('advFocus', b.dataset.adv); } catch (e) { }
+      go('#/settings/advanced');
+    });
+
+    if (navigator.storage && navigator.storage.estimate) {
+      navigator.storage.estimate().then(est => {
+        const el = $('#st-storage');
+        if (el) el.textContent = '브라우저 저장 공간: ' + (est.usage / 1024 / 1024).toFixed(1) + 'MB 사용 / ' +
+          (est.quota / 1024 / 1024 / 1024).toFixed(1) + 'GB 할당';
+      });
+    }
+
+    $('#st-lang').value = lang;
+    $('#st-theme').value = theme;
+    $('#st-lang').onchange = (e) => VN.db.setSetting('defaultLang', e.target.value);
+    $('#st-theme').onchange = async (e) => {
+      await VN.db.setSetting('theme', e.target.value);
+      applyTheme(e.target.value);
+    };
+    $('#st-autosum').onchange = (e) => VN.db.setSetting('autoSummarize', e.target.checked);
+    $('#dr-auto').onchange = (e) => VN.db.setSetting('driveAutoSave', e.target.checked);
+    VN.db.setSetting('apiKey', ''); // 이전 버전의 API 키 설정값 정리
+
+    /* AI 개인화 컨텍스트 — 기본은 빈 값, 저장은 사용자가 직접(자동 강제 주입 없음) */
+    const PERSONA_EXAMPLE = '나는 장례지도사이자 상담심리학을 공부하는 전문가다. ' +
+      '장거리 이동 중 길고 두서없이 떠오르는 생각을 음성으로 기록하는 경우가 많다. ' +
+      '고인을 가족처럼 대하는 마음, 유가족들의 얽힌 심리적 구조, 누군가를 깊이 배려하기 위한 복잡한 절차들이 기록에 자주 등장한다. ' +
+      '요약은 전문 상담 일지나 서비스 기획 노트처럼 논리적이고 정돈된 형태로 작성해 달라.';
+    $('#st-persona-save').onclick = async () => {
+      await VN.db.setSetting('personaContext', $('#st-persona').value.trim());
+      toast('AI 개인화 컨텍스트를 저장했습니다.');
+      rerender();
+    };
+    $('#st-persona-example').onclick = () => {
+      $('#st-persona').value = PERSONA_EXAMPLE;
+      toast('예시를 채웠습니다. 내용을 다듬은 뒤 "저장"을 눌러 주세요.');
+    };
+    if ($('#st-persona-del')) $('#st-persona-del').onclick = async () => {
+      await VN.db.setSetting('personaContext', '');
+      toast('AI 개인화 컨텍스트를 삭제했습니다.');
+      rerender();
+    };
+
+    /* 데이터 관리 */
+    $('#st-backup').onclick = async () => {
+      const btn = $('#st-backup');
+      btn.disabled = true; btn.textContent = '만드는 중…';
+      try {
+        await VN.exporter.downloadBackup($('#st-bk-audio').checked);
+        toast('백업 파일을 내려받았습니다.');
+      } catch (e) { toast('백업 실패: ' + (e.message || e)); }
+      btn.disabled = false; btn.textContent = '백업 파일 다운로드';
+    };
+    $('#st-restore').onclick = () => $('#restore-input').click();
+    $('#st-trash').onclick = () => go('#/trash');
+    $('#st-wipe').onclick = async () => {
+      // 2단계 확인
+      if (!await confirmModal('전체 삭제', '노트·폴더·휴지통·설정이 모두 삭제됩니다.', '계속', true)) return;
+      const word = await promptModal('정말 삭제할까요?', '"삭제"라고 입력하면 진행합니다', '');
+      if (word !== '삭제') { toast('입력이 일치하지 않아 취소했습니다.'); return; }
+      await VN.db.wipeAll();
+      invalidateNotesCache();
+      toast('모든 데이터를 삭제했습니다.');
+      go('#/list');
+    };
+  }
+
+  /* ── 고급 설정 (#/settings/advanced) — 기술 항목을 아코디언으로 ── */
+  async function viewSettingsAdvanced() {
+    const [apiKey, driveFormat, driveAudio, hookUrl, hookToken, driveLast, folderStatus,
+      clientId, gStatus, apiStatus, driveTarget, dgKey, aaiKey, geminiModel, geminiQuality] = await Promise.all([
+      VN.db.getSetting('geminiApiKey', ''),
+      VN.db.getSetting('driveFormat', 'doc'),
+      VN.db.getSetting('driveAudio', false),
+      VN.db.getSetting('appsScriptUrl', ''),
+      VN.db.getSetting('appsScriptToken', ''),
+      VN.drive.getLastResult(),
+      VN.drive.getFolderStatus(),
+      VN.gauth.getClientId(),
+      VN.gauth.status(),
+      VN.drive.getApiStatus(),
+      VN.drive.getTarget(),
+      VN.db.getSetting('deepgramApiKey', ''),
+      VN.db.getSetting('assemblyaiApiKey', ''),
+      VN.db.getSetting('geminiModel', VN.summarizer.DEFAULT_MODEL),
+      VN.db.getSetting('geminiQuality', VN.summarizer.DEFAULT_QUALITY)
+    ]);
+
+    /* open 규칙: 미설정 그룹은 펼침, 설정 완료 그룹은 접힘 */
+    const openMap = {
+      gemini: !apiKey,
+      diarize: !(dgKey || aaiKey),
+      google: !gStatus.signedIn,
+      drive: driveTarget === 'none',
+      tools: false
+    };
+    const group = (key, title, state, body) =>
+      '<details class="settings-group" id="adv-' + key + '"' + (openMap[key] ? ' open' : '') + '>' +
+      '<summary>' + title + (state ? '<span class="group-state">' + state + '</span>' : '') + '</summary>' +
+      '<div class="group-body">' + body + '</div></details>';
+
+    let html = '<div class="topbar"><div class="topbar-row">' +
+      '<button class="icon-btn plain" id="st-back" aria-label="설정으로 돌아가기">←</button>' +
+      '<h1 class="bar-title">고급 설정</h1></div></div>' +
+      '<div class="view under-1">' +
+      '<p class="muted small" style="margin-bottom:14px">키·계정 연동 등 처음 한 번만 만지면 되는 항목입니다. 키는 이 기기의 브라우저에만 저장됩니다.</p>';
+
+    /* ── AI 요약 엔진 (Gemini) ── */
+    html += group('gemini', 'AI 요약 엔진 (Gemini)', apiKey ? '연동됨 ✅' : '미설정',
       '<p class="muted small" style="margin-bottom:8px">API 키를 입력하면 대화 유형(회의·강의·통화·상담 등)에 맞춘 요약·마인드맵·할 일·키워드를 Gemini가 생성하고, 노트에서 "AI에게 질문"도 쓸 수 있습니다. Google AI Studio(aistudio.google.com/apikey)에서 무료 발급, 브라우저에만 저장됨. 실패 시 기본 모드로 자동 폴백합니다.</p>' +
       '<div class="settings-row"><label>Gemini API 키</label>' +
       '<input type="password" id="st-apikey" style="flex:1;min-width:160px" placeholder="' + (apiKey ? '저장됨 (••••' + U.esc(apiKey.slice(-4)) + ')' : 'AIza…') + '">' +
@@ -2082,21 +2429,7 @@ VN.ui = (function () {
       '<option value="quality">정확도 우선 (권장, 느림)</option>' +
       '<option value="speed">속도 우선</option></select></div>' +
       '<p class="muted small">정확도 우선은 모델이 내용을 더 깊이 검토해 결정 사항과 담당자를 정확히 뽑아내지만, 요약 생성에 시간이 더 걸립니다. ' +
-      '품질 설정은 요약에만 적용됩니다(오디오 전사는 항상 속도 우선).</p>' +
-      '<div class="settings-row" style="align-items:flex-start"><label>AI 개인화 컨텍스트</label>' +
-      '<textarea id="st-persona" rows="5" style="flex:1;min-width:200px;resize:vertical" ' +
-      'placeholder="나에 대한 설명을 자유롭게 적어 주세요 (직업, 주 용도, 자주 등장하는 주제, 원하는 요약 스타일 등)">' +
-      U.esc(personaCtx) + '</textarea></div>' +
-      '<div class="settings-row"><label></label>' +
-      '<button class="btn btn-sm btn-primary" id="st-persona-save">저장</button>' +
-      '<button class="btn btn-sm" id="st-persona-example">예시 넣기</button>' +
-      (personaCtx ? '<button class="btn btn-sm" id="st-persona-del">삭제</button>' : '') + '</div>' +
-      '<p class="muted small">AI가 요약·분석할 때 항상 참고하는 나에 대한 설명입니다. ' +
-      'AI 요약(유형 분류·섹션·마인드맵), 오디오 전사(전문 용어 인식), Drive 파일명 주제 생성에 반영됩니다. 이 브라우저에만 저장됩니다.</p>' +
-      '<div class="settings-row"><label>자동 AI 정리</label>' +
-      '<span class="check-row" style="margin:0"><input type="checkbox" id="st-autosum"' + (autoSum ? ' checked' : '') + '>' +
-      '<label for="st-autosum" class="small">변환 완료 후 AI 정리 자동 실행</label></span></div>' +
-      '<p class="muted small">텍스트 변환(업로드·재변환 포함)이 끝나면 AI 정리를 자동으로 생성합니다. 실패해도 변환된 텍스트는 그대로 보존됩니다.</p></div>';
+      '품질 설정은 요약에만 적용됩니다(오디오 전사는 항상 속도 우선).</p>');
 
     /* ── 자동 화자분리 API 키 ── */
     const keyRow = (id, label, val, ph) =>
@@ -2106,13 +2439,13 @@ VN.ui = (function () {
       '<button class="btn btn-sm btn-primary" data-keysave="' + id + '">저장</button>' +
       (val ? '<button class="btn btn-sm" data-keydel="' + id + '">삭제</button>' : '') + '</div>';
 
-    html += '<div class="settings-group"><h2>자동 화자분리 (Deepgram / AssemblyAI)</h2>' +
-      '<p class="muted small" style="margin-bottom:8px">자동 텍스트 변환은 Deepgram(우선) → AssemblyAI(예비) → Gemini 순으로 저장된 키를 사용합니다. Deepgram 키가 있으면 화자까지 자동으로 나눠 전사합니다. 키는 이 브라우저(IndexedDB)에만 저장됩니다.</p>' +
+    html += group('diarize', '자동 화자분리 (Deepgram / AssemblyAI)', (dgKey || aaiKey) ? '연동됨 ✅' : '미설정',
+      '<p class="muted small" style="margin-bottom:8px">자동 텍스트 변환은 Deepgram(우선) → AssemblyAI(예비) → Gemini 순으로 저장된 키를 사용합니다. Deepgram 키가 있으면 화자까지 자동으로 나눠 전사합니다. 키는 이 기기의 브라우저에만 저장됩니다.</p>' +
       keyRow('st-dg-key', 'Deepgram API 키', dgKey, '키 입력') +
-      keyRow('st-aai-key', 'AssemblyAI API 키', aaiKey, '키 입력') + '</div>';
+      keyRow('st-aai-key', 'AssemblyAI API 키', aaiKey, '키 입력'));
 
     /* ── Google 계정 (OAuth) ── */
-    html += '<div class="settings-group"><h2>Google 계정 (Drive API · Calendar)</h2>' +
+    html += group('google', 'Google 계정 (Drive API · Calendar)', gStatus.signedIn ? '로그인됨 ✅' : '미설정',
       '<p class="muted small" style="margin-bottom:8px">로그인하면 Android에서도 별도 설정 없이 회의록이 Drive에 업로드되고, 캘린더 일정으로 회의 제목·참석자를 자동으로 채웁니다. 클라이언트 ID 발급 방법은 README의 "Google Cloud 콘솔 설정"을 참고하세요.</p>' +
       '<div class="settings-row"><label>클라이언트 ID</label>' +
       '<input type="text" id="ga-clientid" style="flex:1;min-width:200px" value="' + U.esc(clientId) + '" placeholder="…apps.googleusercontent.com">' +
@@ -2132,7 +2465,7 @@ VN.ui = (function () {
       (apiStatus.folderName
         ? '<span class="small">📁 ' + U.esc(apiStatus.folderName) + '</span>'
         : '<span class="muted small">아직 확인 안 됨 (저장 시 "' + U.esc(VN.drive.FOLDER_NAME) + '" 폴더를 찾거나 만듭니다)</span>') +
-      '<button class="btn btn-sm" id="ga-refolder"' + (gStatus.configured ? '' : ' disabled') + '>폴더 다시 찾기</button></div></div>';
+      '<button class="btn btn-sm" id="ga-refolder"' + (gStatus.configured ? '' : ' disabled') + '>폴더 다시 찾기</button></div>');
 
     /* ── Google Drive 자동 저장 ── */
     const APPS_SCRIPT_CODE =
@@ -2148,9 +2481,8 @@ VN.ui = (function () {
       "function folder_(name){ const it = DriveApp.getFoldersByName(name); return it.hasNext() ? it.next() : DriveApp.createFolder(name); }\n" +
       "function out_(o){ return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON); }";
 
-    html += '<div class="settings-group"><h2>Google Drive 자동 저장</h2>' +
-      '<p class="muted small" style="margin-bottom:8px">녹음 종료·업로드 변환 직후 회의록을 자동 저장합니다. 파일명은 <b>날짜_시각_대화주제</b>(연결된 캘린더 일정 제목 우선, 없으면 Gemini 주제·키워드)로 만들어집니다. 아래에서 고른 <b>한 경로</b>에만 저장됩니다.</p>' +
-      '<div class="settings-row"><label>자동 저장</label><input type="checkbox" id="dr-auto"' + (driveAuto ? ' checked' : '') + '></div>' +
+    let driveBody =
+      '<p class="muted small" style="margin-bottom:8px">녹음 종료·업로드 변환 직후 회의록을 자동 저장합니다. 파일명은 <b>날짜_시각_대화주제</b>(연결된 캘린더 일정 제목 우선, 없으면 Gemini 주제·키워드)로 만들어집니다. 아래에서 고른 <b>한 경로</b>에만 저장됩니다. 자동 저장 켜기/끄기는 설정 메인의 "기본"에 있습니다.</p>' +
       '<div class="settings-row" style="align-items:flex-start"><label>저장 경로</label>' +
       '<div style="display:flex;flex-direction:column;gap:6px">' +
       [['folder', 'PC 폴더 (Google Drive for Desktop)'],
@@ -2166,7 +2498,7 @@ VN.ui = (function () {
       '<option value="txt"' + (driveFormat === 'txt' ? ' selected' : '') + '>TXT (텍스트)</option></select>' +
       '<span class="check-row" style="margin:0"><input type="checkbox" id="dr-audio"' + (driveAudio ? ' checked' : '') + '><label for="dr-audio" class="small">오디오(webm)도 함께 저장</label></span></div>';
     if (folderStatus.supported) {
-      html += '<div class="settings-row"><label>PC 저장 폴더</label>' +
+      driveBody += '<div class="settings-row"><label>PC 저장 폴더</label>' +
         (folderStatus.name
           ? '<span class="small">📁 ' + U.esc(folderStatus.name) + (folderStatus.permission === 'granted' ? '' : ' <span style="color:var(--danger)">(재승인 필요)</span>') + '</span>'
           : '<span class="muted small">선택 안 됨 — 예: G:\\내 드라이브\\회의록</span>') +
@@ -2175,9 +2507,9 @@ VN.ui = (function () {
         (folderStatus.name ? '<button class="btn btn-sm" id="dr-unpick">해제</button>' : '') +
         '</div>';
     } else {
-      html += '<p class="muted small">이 브라우저는 PC 폴더 저장(File System Access API)을 지원하지 않습니다. Android에서는 아래 Apps Script 웹훅을 사용하세요.</p>';
+      driveBody += '<p class="muted small">이 브라우저는 PC 폴더 저장(File System Access API)을 지원하지 않습니다. Android에서는 아래 Apps Script 웹훅을 사용하세요.</p>';
     }
-    html += '<div class="settings-row"><label>Apps Script URL</label><input type="text" id="dr-url" style="flex:1;min-width:160px" value="' + U.esc(hookUrl) + '" placeholder="https://script.google.com/macros/s/…/exec"></div>' +
+    driveBody += '<div class="settings-row"><label>Apps Script URL</label><input type="text" id="dr-url" style="flex:1;min-width:160px" value="' + U.esc(hookUrl) + '" placeholder="https://script.google.com/macros/s/…/exec"></div>' +
       '<div class="settings-row"><label>비밀 토큰</label><input type="password" id="dr-token" style="flex:1;min-width:120px" value="' + U.esc(hookToken) + '" placeholder="Apps Script의 SECRET 값">' +
       '<button class="btn btn-sm btn-primary" id="dr-hook-save">저장</button></div>' +
       '<div class="muted small" id="dr-last" style="margin-top:4px">' +
@@ -2189,50 +2521,44 @@ VN.ui = (function () {
       '3. 웹 앱 <b>URL 복사</b> → 위 "Apps Script URL"에 붙여넣고, SECRET 값을 "비밀 토큰"에 입력 후 저장<br>' +
       '· 회의록은 내 Drive의 <b>회의록</b> 폴더에 저장됩니다. 전송 실패 시 재시도 큐에 보관했다가 앱 시작 시 다시 보냅니다. 18MB 초과 페이로드는 건너뜁니다.</div>' +
       '<pre style="overflow:auto;background:var(--bg-hover);padding:10px;border-radius:8px;font-size:11px;line-height:1.5;margin-top:8px">' + U.esc(APPS_SCRIPT_CODE) + '</pre>' +
-      '</details></div>';
+      '</details>';
 
-    html += '<div class="settings-group"><h2>데이터 관리</h2>' +
-      '<div class="settings-row"><label>전체 백업</label>' +
-      '<span class="check-row" style="margin:0"><input type="checkbox" id="st-bk-audio" checked><label for="st-bk-audio" class="small">오디오 포함(base64)</label></span>' +
-      '<button class="btn btn-sm" id="st-backup">백업 파일 다운로드</button></div>' +
-      '<div class="settings-row"><label>복원 (가져오기)</label><button class="btn btn-sm" id="st-restore">백업 파일 선택</button></div>' +
-      '<div class="settings-row"><label>전체 삭제</label><button class="btn btn-sm btn-danger" id="st-wipe">모든 데이터 삭제</button></div>' +
-      '<p class="muted small">클라우드 동기화 대신 백업 파일로 다른 기기에 옮길 수 있습니다.</p></div>';
+    html += group('drive', 'Google Drive 저장 상세',
+      driveTarget !== 'none' ? U.esc(TARGET_LABEL[driveTarget] || driveTarget) : '미설정', driveBody);
 
-    html += '<div class="settings-group"><h2>데모</h2>' +
+    /* ── 도구 ── */
+    html += group('tools', '도구', '',
       '<div class="settings-row"><label>데모 노트</label><button class="btn btn-sm btn-primary" id="st-demo">데모 노트 생성</button></div>' +
-      '<p class="muted small">회의 시나리오(화자 3인·메모·북마크·하이라이트·합성 오디오)가 담긴 예시 노트를 만듭니다.</p></div>';
-
-    html += '<div class="settings-group"><h2>도움말</h2><div class="muted small" style="line-height:1.8">' +
-      '· 마이크 녹음과 실시간 음성인식은 Chrome/Edge + localhost(또는 HTTPS)에서만 동작합니다.<br>' +
-      '· 실시간 음성인식(SpeechRecognition)은 브라우저가 제공하는 온라인 서비스라 인터넷 연결이 필요합니다.<br>' +
-      '· Firefox는 음성인식을 지원하지 않아 녹음만 가능합니다. 녹음을 마치면 자동 텍스트 변환이 시작됩니다.<br>' +
-      '· 모든 데이터는 이 브라우저(IndexedDB)에만 저장됩니다. 브라우저 데이터 삭제 시 함께 삭제되니 주기적으로 백업하세요.</div></div>';
+      '<p class="muted small">회의 시나리오(화자 3인·메모·북마크·하이라이트·합성 오디오)가 담긴 예시 노트를 만듭니다.</p>');
 
     html += '</div>';
     main().innerHTML = html;
 
-    /* async 핸들러가 끝났을 때 이미 다른 화면으로 이동했을 수 있다 —
-       설정 화면이 여전히 열려 있을 때만 재렌더한다 (다른 화면을 덮어쓰는 사고 방지) */
-    const rerender = () => { if (location.hash.startsWith('#/settings')) viewSettings(); };
-
-    $('#st-back').onclick = () => go('#/list');
-
-    if (navigator.storage && navigator.storage.estimate) {
-      navigator.storage.estimate().then(est => {
-        const el = $('#st-storage');
-        if (el) el.textContent = '브라우저 저장 공간: ' + (est.usage / 1024 / 1024).toFixed(1) + 'MB 사용 / ' +
-          (est.quota / 1024 / 1024 / 1024).toFixed(1) + 'GB 할당';
-      });
+    /* advFocus 딥링크: 해당 그룹 펼치고 스크롤 (연동 상태 카드 [관리]·오류 안내에서 진입) */
+    let advFocus = null;
+    try { advFocus = sessionStorage.getItem('advFocus'); sessionStorage.removeItem('advFocus'); } catch (e) { }
+    if (advFocus) {
+      const g = $('#adv-' + advFocus);
+      if (g) {
+        g.open = true;
+        setTimeout(() => g.scrollIntoView({ behavior: 'smooth', block: 'start' }), 60);
+      }
     }
 
-    $('#st-lang').value = lang;
-    $('#st-theme').value = theme;
-    $('#st-lang').onchange = (e) => VN.db.setSetting('defaultLang', e.target.value);
-    $('#st-theme').onchange = async (e) => {
-      await VN.db.setSetting('theme', e.target.value);
-      applyTheme(e.target.value);
+    /* 저장 후 재렌더 — 스크롤 위치와 펼침 상태 유지, 고급 설정이 열려 있을 때만
+       (async 핸들러가 끝났을 때 이미 다른 화면으로 이동했을 수 있다) */
+    const rerender = () => {
+      if (!location.hash.startsWith('#/settings/advanced')) return;
+      const y = window.scrollY;
+      const opened = $$('details.settings-group').filter(d => d.open).map(d => d.id);
+      viewSettingsAdvanced().then(() => {
+        opened.forEach(id => { const d = document.getElementById(id); if (d) d.open = true; });
+        window.scrollTo(0, y);
+      });
     };
+
+    $('#st-back').onclick = () => go('#/settings');
+
     $('#st-gemini-model').value = VN.summarizer.SUMMARY_MODELS.indexOf(geminiModel) !== -1 ? geminiModel : VN.summarizer.DEFAULT_MODEL;
     $('#st-gemini-model').onchange = async (e) => {
       await VN.db.setSetting('geminiModel', e.target.value);
@@ -2255,27 +2581,6 @@ VN.ui = (function () {
       toast('API 키를 삭제했습니다.');
       rerender();
     };
-    /* AI 개인화 컨텍스트 — 기본은 빈 값, 저장은 사용자가 직접(자동 강제 주입 없음) */
-    const PERSONA_EXAMPLE = '나는 장례지도사이자 상담심리학을 공부하는 전문가다. ' +
-      '장거리 이동 중 길고 두서없이 떠오르는 생각을 음성으로 기록하는 경우가 많다. ' +
-      '고인을 가족처럼 대하는 마음, 유가족들의 얽힌 심리적 구조, 누군가를 깊이 배려하기 위한 복잡한 절차들이 기록에 자주 등장한다. ' +
-      '요약은 전문 상담 일지나 서비스 기획 노트처럼 논리적이고 정돈된 형태로 작성해 달라.';
-    $('#st-persona-save').onclick = async () => {
-      await VN.db.setSetting('personaContext', $('#st-persona').value.trim());
-      toast('AI 개인화 컨텍스트를 저장했습니다.');
-      rerender();
-    };
-    $('#st-persona-example').onclick = () => {
-      $('#st-persona').value = PERSONA_EXAMPLE;
-      toast('예시를 채웠습니다. 내용을 다듬은 뒤 "저장"을 눌러 주세요.');
-    };
-    if ($('#st-persona-del')) $('#st-persona-del').onclick = async () => {
-      await VN.db.setSetting('personaContext', '');
-      toast('AI 개인화 컨텍스트를 삭제했습니다.');
-      rerender();
-    };
-    $('#st-autosum').onchange = (e) => VN.db.setSetting('autoSummarize', e.target.checked);
-    VN.db.setSetting('apiKey', ''); // 이전 버전의 API 키 설정값 정리
     /* 키 입력칸에서 Enter 로도 저장되게 (버튼을 못 찾는 경우가 많아 추가) */
     [['#st-apikey', '#st-apikey-save'], ['#ga-clientid', '#ga-clientid-save'],
      ['#dr-url', '#dr-hook-save'], ['#dr-token', '#dr-hook-save'],
@@ -2284,8 +2589,7 @@ VN.ui = (function () {
         const el = $(input), btn = $(button);
         if (el && btn) el.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); btn.click(); } };
       });
-    /* Drive 설정 핸들러 */
-    $('#dr-auto').onchange = (e) => VN.db.setSetting('driveAutoSave', e.target.checked);
+    /* Drive 설정 핸들러 (자동 저장 ON/OFF는 설정 메인) */
     $('#dr-fmt').onchange = (e) => VN.db.setSetting('driveFormat', e.target.value);
     $('#dr-audio').onchange = (e) => VN.db.setSetting('driveAudio', e.target.checked);
     if ($('#dr-pick')) $('#dr-pick').onclick = async () => {
@@ -2361,30 +2665,12 @@ VN.ui = (function () {
       } catch (e) { toast('폴더 확인 실패: ' + ((e && e.message) || e)); }
       rerender();
     };
-    $('#st-backup').onclick = async () => {
-      const btn = $('#st-backup');
-      btn.disabled = true; btn.textContent = '만드는 중…';
-      try {
-        await VN.exporter.downloadBackup($('#st-bk-audio').checked);
-        toast('백업 파일을 내려받았습니다.');
-      } catch (e) { toast('백업 실패: ' + (e.message || e)); }
-      btn.disabled = false; btn.textContent = '백업 파일 다운로드';
-    };
-    $('#st-restore').onclick = () => $('#restore-input').click();
-    $('#st-wipe').onclick = async () => {
-      // 2단계 확인
-      if (!await confirmModal('전체 삭제', '노트·폴더·휴지통·설정이 모두 삭제됩니다.', '계속', true)) return;
-      const word = await promptModal('정말 삭제할까요?', '"삭제"라고 입력하면 진행합니다', '');
-      if (word !== '삭제') { toast('입력이 일치하지 않아 취소했습니다.'); return; }
-      await VN.db.wipeAll();
-      toast('모든 데이터를 삭제했습니다.');
-      go('#/list');
-    };
     $('#st-demo').onclick = async () => {
       const btn = $('#st-demo');
       btn.disabled = true; btn.textContent = '생성 중…';
       try {
         const note = await VN.demo.seedDemo();
+        invalidateNotesCache();
         toast('데모 노트를 만들었습니다.');
         go('#/note/' + note.id);
       } catch (e) {
@@ -2400,6 +2686,8 @@ VN.ui = (function () {
     S.theme = theme;
     const dark = theme === 'dark' || (theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
     document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+    // 다음 로드에서 CSS 적용 전에 쓸 수 있게 미러 (index.html head 인라인 스크립트가 읽음 — FOUC 방지)
+    try { localStorage.setItem('vnTheme', dark ? 'dark' : 'light'); } catch (e) { /* ignore */ }
   }
 
   /* ══════════════ 초기화 ══════════════ */
@@ -2425,6 +2713,7 @@ VN.ui = (function () {
       try {
         const data = JSON.parse(await f.text());
         const r = await VN.db.restoreBackup(data);
+        invalidateNotesCache();
         toast('복원 완료: 노트 ' + r.notes + '개, 폴더 ' + r.folders + '개');
         route();
       } catch (err) { toast('복원 실패: ' + (err.message || err)); }
@@ -2464,8 +2753,8 @@ VN.ui = (function () {
     // 캡처 관련(MediaRecorder·STT·flush)은 여기서 아무것도 멈추지 않는다.
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState !== 'visible' || !S.rec || !S.rec.active) return;
-      const wl = $('#rec-wakelock');
-      if (wl && wl.checked) acquireWakeLock();
+      const wl = $('#rec-wakelock-btn');
+      if (wl && wl.classList.contains('on')) acquireWakeLock();
       if (S.rec.sttOn && !S.rec.sttWarned && Date.now() - VN.stt.lastResultAt() > 60000) {
         S.rec.sttWarned = true;
         const warn = $('#rec-warn');
@@ -2473,12 +2762,22 @@ VN.ui = (function () {
       }
     });
 
-    // 자동 전사 진행 알림: 완료 토스트 + 보고 있는 화면 갱신 + AI 정리 자동 생성 + Drive 자동 저장(변환 완료 후 1회)
+    // 자동 전사 진행 알림: 노트를 보고 있으면 인라인 배너(변환 중 → AI 정리 중 → Drive 저장됨 ✓),
+    // 노트 밖에 있을 때만 완료 토스트 1개. 편집 중이면 재렌더를 미룬다(입력 증발 방지).
     VN.transcribe.setListener(async (note, phase) => {
-      if (phase === 'done') toast('"' + note.title + '" 텍스트 변환 완료 (' + (note.segments || []).length + '개 구간)');
-      else if (phase === 'error' || phase === 'blocked') toast(note.transcribeError || '텍스트 변환에 실패했습니다.', 5000);
+      invalidateNotesCache();
       const hash = location.hash || '#/list';
-      if (S.note && S.note.id === note.id && hash.startsWith('#/note/')) await viewNote(note.id);
+      const viewing = S.note && S.note.id === note.id && hash.startsWith('#/note/');
+      if (phase === 'done') {
+        if (!viewing) toast('"' + note.title + '" 텍스트 변환 완료 (' + (note.segments || []).length + '개 구간)');
+      } else if (phase === 'error' || phase === 'blocked') {
+        toast(note.transcribeError || '텍스트 변환에 실패했습니다.', 5000);
+      }
+      if (viewing) {
+        if (phase === 'start') setNotePipe(note.id, '⏳ 자동 텍스트 변환 중 — 화면을 이동해도 계속됩니다.');
+        else if (isEditingDom()) toast('처리가 끝났습니다. 편집을 마치면 새로 고쳐집니다.');
+        else await viewNote(note.id);
+      }
       else if (hash === '' || hash === '#' || hash.startsWith('#/list') || hash.startsWith('#/fav') || hash.startsWith('#/folder')) await route();
       // 변환 성공 → (설정 시) AI 정리 자동 생성 → Drive 자동 저장 1회.
       // 요약을 먼저 만들어야 Drive 문서에 AI 정리가 담기고 파일명 주제도 좋아진다.
@@ -2510,7 +2809,8 @@ VN.ui = (function () {
   }
 
   return {
-    init, route, go, toast, refresh,
+    init, route, go, toast,
+    refresh: () => refresh(true),             // 외부 호출은 항상 강제 재조회 (demo 등)
     searchNotes, replaceInNote, isMobileUA,   // 순수 함수 (셀프테스트용)
     importFiles, notifyAuthExpired,
     getState() {

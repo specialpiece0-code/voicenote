@@ -132,7 +132,7 @@ VN.transcribe = (function () {
     const chain = await availableChain();
     if (!chain.length) {
       note.transcribePending = false;
-      note.transcribeError = '전사 엔진 키가 없습니다. 설정에서 Deepgram 또는 Gemini 키를 등록하세요.';
+      note.transcribeError = '자동 텍스트 변환에는 무료 AI 키가 1개 필요합니다. 설정 → 고급 설정에서 1분이면 등록할 수 있어요.';
       try { await VN.db.saveNote(note); } catch (e) { /* ignore */ }
       notify(note, 'blocked');
       return { started: false, reason: 'no-keys' };

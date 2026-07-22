@@ -57,14 +57,24 @@ VN.player = (function () {
       return (d && d !== Infinity && !isNaN(d)) ? d : (duration || 1);
     }
 
-    /* 파형 시크바 */
+    /* 파형 시크바 — 탭 + 드래그 시크 (pointer capture) */
     function bindWave(canvas) {
       waveCanvas = canvas;
-      canvas.addEventListener('click', function (e) {
+      let dragging = false;
+      const seekFromEvent = function (e) {
         const rect = canvas.getBoundingClientRect();
-        const ratio = (e.clientX - rect.left) / rect.width;
+        const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
         seekTo(ratio * getDuration());
+      };
+      canvas.addEventListener('pointerdown', function (e) {
+        dragging = true;
+        try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+        seekFromEvent(e);
       });
+      canvas.addEventListener('pointermove', function (e) { if (dragging) seekFromEvent(e); });
+      const endDrag = function () { dragging = false; };
+      canvas.addEventListener('pointerup', endDrag);
+      canvas.addEventListener('pointercancel', endDrag);
       drawWave();
     }
 
