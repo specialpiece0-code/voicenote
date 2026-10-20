@@ -220,3 +220,7 @@ A. 설정에 Gemini API 키를 입력하면 고급 모드(기본 `gemini-3.6-fla
 - 프레임워크/빌드 도구/npm 없음. `js/*.js`가 전역 네임스페이스 `VN.*`로 로드 순서 고정.
 - 콘솔 테스트 훅: `window.__vnDebug.runSelfTest()` — 요약기·요약 스키마 정규화·SRT/TXT/VTT·검색·바꾸기·DB CRUD·백업 직렬화·Drive 파일명 생성·웹훅 페이로드 직렬화·녹음 복구 스냅샷·Drive multipart 본문 조립·캘린더 이벤트 매핑·토큰 만료 판정·요약 품질 모드·로컬 주제 어미 필터·백업 민감정보 제외·관용 JSON 배열 파서·문장 단위 세그먼트 청커·자동 전사 관리자(엔진 체인·결과 적용)·모바일 UA 감지·화자 체계(참석A/B 기본명·아바타 글자)·적응형 요약 스키마 정규화(구형 하위 호환·마인드맵 상한)·마인드맵 레이아웃(총 25개)을 실제 실행해 `{name, pass, detail}[]` 반환.
 - `__vnDebug.seedDemo()`, `__vnDebug.createNoteFromBlob(blob, name)`, `__vnDebug.getState()` 제공.
+
+## 라이선스
+
+MIT License — 자세한 내용은 [LICENSE](LICENSE) 파일을 보세요.
